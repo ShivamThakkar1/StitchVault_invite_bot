@@ -629,7 +629,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
       inline_keyboard: [
         [{ text: '📱 Join StitchVault', url: `https://t.me/${CHANNEL_USERNAME}` }],
         [{ text: '🔗 Get Invite Link', callback_data: 'get_link' }],
-        [{ text: '❓ Help', callback_data: 'help' }, { text: '📊 Stats', callback_data: 'my_stats' }]
+        [{ text: '📊 Stats', callback_data: 'my_stats' }, { text: '❓ Help', callback_data: 'help' }]
       ]
     };
     
