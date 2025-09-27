@@ -203,10 +203,25 @@ async function sendToChannel(communityCount = 0) {
     // Send image first (no caption)
     if (imageReward) {
       try {
-        const imageMessage = await bot.sendPhoto(CHANNEL_ID, imageReward.imagePath || imageReward.filePath);
-        imageMessageId = imageMessage.message_id;
+        const fileToSend = imageReward.imagePath || imageReward.filePath;
+        
+        if (imageReward.isImageFile) {
+          const imageMessage = await bot.sendPhoto(CHANNEL_ID, fileToSend);
+          imageMessageId = imageMessage.message_id;
+        } else {
+          // If marked as image but not actually image, send as document
+          const imageMessage = await bot.sendDocument(CHANNEL_ID, fileToSend);
+          imageMessageId = imageMessage.message_id;
+        }
       } catch (error) {
         console.error('Error sending image:', error);
+        // If photo fails, try as document
+        try {
+          const imageMessage = await bot.sendDocument(CHANNEL_ID, imageReward.imagePath || imageReward.filePath);
+          imageMessageId = imageMessage.message_id;
+        } catch (docError) {
+          console.error('Error sending as document:', docError);
+        }
       }
     }
     
@@ -523,38 +538,38 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     
     if (isNewUser && hasReferrer) {
       welcomeMessage = 
-        `Welcome to StitchVault Community!\n\n` +
-        `You were invited to join our creative community!\n` +
-        `You received a welcome bonus!\n\n` +
-        `Join @${CHANNEL_USERNAME} to help unlock community designs!\n\n` +
-        `Community Progress: ${communityCount} referrals\n` +
-        `Next unlock: ${needed} more referrals needed\n\n` +
-        `Every ${INVITES_PER_REWARD} community referrals unlocks exclusive content for everyone!`;
+        `🎉 Welcome to StitchVault Community!\n\n` +
+        `🔥 You were invited to join our creative community!\n` +
+        `🎁 You received a welcome bonus!\n\n` +
+        `⚠️ **IMPORTANT: Join @${CHANNEL_USERNAME} first to help unlock community designs!**\n\n` +
+        `🏆 Community Progress: ${communityCount} referrals\n` +
+        `🎯 Next unlock: ${needed} more referrals needed\n\n` +
+        `💡 Every ${INVITES_PER_REWARD} community referrals unlocks exclusive content for everyone!`;
     } else if (isNewUser) {
       welcomeMessage = 
-        `Welcome to StitchVault Community!\n\n` +
-        `You received a welcome bonus!\n` +
-        `Join @${CHANNEL_USERNAME} to access our design community!\n\n` +
-        `Community Progress: ${communityCount} referrals\n` +
-        `Next unlock: ${needed} more needed\n\n` +
-        `Get your invite link: /link\n` +
-        `Need help: /help`;
+        `🎉 Welcome to StitchVault Community!\n\n` +
+        `🎁 You received a welcome bonus!\n` +
+        `📱 **Join @${CHANNEL_USERNAME} to access our design community!**\n\n` +
+        `🏆 Community Progress: ${communityCount} referrals\n` +
+        `🎯 Next unlock: ${needed} more needed\n\n` +
+        `🔗 Get your invite link: /link\n` +
+        `❓ Need help: /help`;
     } else {
       welcomeMessage = 
-        `Welcome back to StitchVault, ${msg.from.first_name}!\n\n` +
-        `Your referrals: ${user.inviteCount}\n` +
-        `Community total: ${communityCount}\n` +
-        `Next unlock: ${needed} more referrals\n\n` +
-        `Your invite link: /link\n` +
-        `Your stats: /stats`;
+        `👋 Welcome back to StitchVault, ${msg.from.first_name}!\n\n` +
+        `👤 Your referrals: ${user.inviteCount}\n` +
+        `🏆 Community total: ${communityCount}\n` +
+        `🎯 Next unlock: ${needed} more referrals\n\n` +
+        `🔗 Your invite link: /link\n` +
+        `📊 Your stats: /stats`;
     }
     
     const keyboard = {
       inline_keyboard: [
-        [{ text: 'Join StitchVault', url: `https://t.me/${CHANNEL_USERNAME}` }],
-        [{ text: 'Get Invite Link', callback_data: 'get_link' }],
-        [{ text: 'My Stats', callback_data: 'my_stats' }],
-        [{ text: 'Help', callback_data: 'help' }]
+        [{ text: '📱 Join StitchVault', url: `https://t.me/${CHANNEL_USERNAME}` }],
+        [{ text: '🔗 Get Invite Link', callback_data: 'get_link' }],
+        [{ text: '📊 My Stats', callback_data: 'my_stats' }],
+        [{ text: '❓ Help', callback_data: 'help' }]
       ]
     };
     
@@ -906,7 +921,7 @@ bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
     const fileReward = await Reward.findOne({ level, isImageFile: false });
     
     if (!imageReward && !fileReward) {
-      return bot.sendMessage(chatId, `No rewards found for level ${level}`);
+      return bot.sendMessage(chatId, `❌ No rewards found for level ${level}`);
     }
     
     let results = [];
@@ -915,11 +930,21 @@ bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
     
     if (imageReward) {
       try {
-        const imageMessage = await bot.sendPhoto(CHANNEL_ID, imageReward.imagePath || imageReward.filePath);
-        imageMessageId = imageMessage.message_id;
-        results.push(`Image sent: ${imageReward.fileName}`);
+        // Check if it's actually an image file
+        const fileToSend = imageReward.imagePath || imageReward.filePath;
+        
+        if (imageReward.isImageFile) {
+          const imageMessage = await bot.sendPhoto(CHANNEL_ID, fileToSend);
+          imageMessageId = imageMessage.message_id;
+          results.push(`🖼️ Image sent: ${imageReward.fileName}`);
+        } else {
+          // If marked as image but not actually image, send as document
+          const imageMessage = await bot.sendDocument(CHANNEL_ID, fileToSend);
+          imageMessageId = imageMessage.message_id;
+          results.push(`📁 Image (as document) sent: ${imageReward.fileName}`);
+        }
       } catch (error) {
-        results.push(`Image failed: ${error.message}`);
+        results.push(`❌ Image failed: ${error.message}`);
       }
     }
     
@@ -927,9 +952,9 @@ bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
       try {
         const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
         fileMessageId = fileMessage.message_id;
-        results.push(`File sent: ${fileReward.fileName}`);
+        results.push(`📁 File sent: ${fileReward.fileName}`);
       } catch (error) {
-        results.push(`File failed: ${error.message}`);
+        results.push(`❌ File failed: ${error.message}`);
       }
     }
     
@@ -946,14 +971,14 @@ bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
     }
     
     bot.sendMessage(chatId, 
-      `Manual Channel Post Results:\n\n` +
+      `📢 Manual Channel Post Results:\n\n` +
       results.join('\n') +
-      `\n\nChannel: @${CHANNEL_USERNAME}`
+      `\n\n📱 Channel: @${CHANNEL_USERNAME}`
     );
     
   } catch (error) {
     console.error('Send channel error:', error);
-    bot.sendMessage(chatId, `Error: ${error.message}`);
+    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
   }
 });
 
@@ -1236,16 +1261,18 @@ async function periodicMembershipCheck() {
               await countReferral(user);
               
               bot.sendMessage(user.userId, 
-                `Welcome to StitchVault!\n\n` +
-                `Your referral counted toward community goals!\n` +
-                `Help unlock more exclusive designs!\n\n` +
-                `Get your invite link: /link`
+                `🎉 Welcome to StitchVault community!\n\n` +
+                `✅ Your referral has been counted toward our community goal!\n` +
+                `🎨 Help us unlock more exclusive design collections!\n\n` +
+                `🔗 Get your invite link: /link\n` +
+                `📊 Check community progress: /stats`
               ).catch(() => {});
             } else {
               bot.sendMessage(user.userId, 
-                `Welcome to StitchVault!\n\n` +
-                `Help our community unlock exclusive designs!\n\n` +
-                `Get your invite link: /link`
+                `🎉 Welcome to StitchVault!\n\n` +
+                `🎨 Start helping our community unlock exclusive designs!\n\n` +
+                `🔗 Get your invite link: /link\n` +
+                `📊 Check community progress: /stats`
               ).catch(() => {});
             }
           }
@@ -1298,16 +1325,16 @@ bot.on('chat_member', async (chatMember) => {
               await countReferral(user);
               
               bot.sendMessage(userId, 
-                `Welcome to StitchVault!\n\n` +
-                `Your referral counted!\n` +
-                `Help unlock more designs!\n\n` +
-                `Get your link: /link`
+                `🎉 Welcome to StitchVault community!\n\n` +
+                `✅ Your referral counted toward our community goal!\n` +
+                `🎨 Help us unlock more exclusive designs!\n\n` +
+                `🔗 Get your invite link: /link`
               ).catch(() => {});
             } else {
               bot.sendMessage(userId, 
-                `Welcome to StitchVault!\n\n` +
-                `Help unlock exclusive designs!\n\n` +
-                `Get your link: /link`
+                `🎉 Welcome to StitchVault!\n\n` +
+                `🎨 Help our community unlock exclusive designs!\n\n` +
+                `🔗 Get your invite link: /link`
               ).catch(() => {});
             }
           }
