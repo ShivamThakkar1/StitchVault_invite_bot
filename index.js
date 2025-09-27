@@ -194,7 +194,7 @@ async function checkUserBlocked(userId) {
   return user && user.isBlocked;
 }
 
-// Fixed sendToChannel function - forces images to be sent as photos
+// Fixed sendToChannel function - downloads and re-uploads images as photos
 async function sendToChannel(communityCount = 0, isTest = false) {
   try {
     const rewardLevel = Math.floor(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
@@ -214,25 +214,25 @@ async function sendToChannel(communityCount = 0, isTest = false) {
     let fileMessageId = null;
     let results = [];
     
-    // Send image first - FORCE as photo if it's an image file
+    // Send image first - download and re-upload as photo
     if (imageReward) {
       try {
         const fileToSend = imageReward.imagePath || imageReward.filePath;
-        console.log(`Attempting to send image as photo: ${imageReward.fileName}`);
+        console.log(`Downloading and sending image as photo: ${imageReward.fileName}`);
         
-        // Always try to send as photo first for image files, regardless of how they were uploaded
-        const imageMessage = await bot.sendPhoto(CHANNEL_ID, fileToSend);
+        // Download and re-upload as photo
+        const imageMessage = await downloadAndSendAsPhoto(CHANNEL_ID, fileToSend, imageReward.fileName);
         imageMessageId = imageMessage.message_id;
-        results.push(`✅ Image sent as photo: ${imageReward.fileName}`);
+        results.push(`✅ Image downloaded and sent as photo: ${imageReward.fileName}`);
         
-      } catch (photoError) {
-        console.error('Photo send failed:', photoError.message);
+      } catch (downloadError) {
+        console.error('Download and photo send failed:', downloadError.message);
         try {
-          // Only fallback to document if photo absolutely fails
+          // Fallback to sending as document
           const fileToSend = imageReward.imagePath || imageReward.filePath;
           const imageMessage = await bot.sendDocument(CHANNEL_ID, fileToSend);
           imageMessageId = imageMessage.message_id;
-          results.push(`📄 Image sent as document (photo failed): ${imageReward.fileName}`);
+          results.push(`📄 Image sent as document (download failed): ${imageReward.fileName}`);
         } catch (docError) {
           console.error('Document fallback also failed:', docError);
           results.push(`❌ Image failed completely: ${docError.message}`);
@@ -240,24 +240,24 @@ async function sendToChannel(communityCount = 0, isTest = false) {
       }
     }
     
-    // Send file second - check if it's actually an image that should be sent as photo
+    // Send file second - check if it's an image and download/re-upload
     if (fileReward) {
       try {
         const isImageByFilename = isDocumentAnImage(fileReward.fileName);
         
         if (isImageByFilename) {
-          // This "file" is actually an image, force send as photo
-          console.log(`Attempting to send file as photo: ${fileReward.fileName}`);
+          // This "file" is actually an image, download and send as photo
+          console.log(`Downloading and sending file as photo: ${fileReward.fileName}`);
           try {
-            const fileMessage = await bot.sendPhoto(CHANNEL_ID, fileReward.filePath);
+            const fileMessage = await downloadAndSendAsPhoto(CHANNEL_ID, fileReward.filePath, fileReward.fileName);
             fileMessageId = fileMessage.message_id;
-            results.push(`✅ File sent as photo: ${fileReward.fileName}`);
-          } catch (photoError) {
-            console.error('Photo send failed for file:', photoError.message);
+            results.push(`✅ File downloaded and sent as photo: ${fileReward.fileName}`);
+          } catch (downloadError) {
+            console.error('Download and photo send failed for file:', downloadError.message);
             // Fallback to document
             const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
             fileMessageId = fileMessage.message_id;
-            results.push(`📄 File sent as document (photo failed): ${fileReward.fileName}`);
+            results.push(`📄 File sent as document (download failed): ${fileReward.fileName}`);
           }
         } else {
           // Not an image, send as document normally
@@ -282,12 +282,14 @@ async function sendToChannel(communityCount = 0, isTest = false) {
       });
       await channelPost.save();
       
-      // Update stats
-      await Stats.findOneAndUpdate(
-        {},
-        { lastChannelPost: new Date() },
-        { upsert: true }
-      );
+      // Update stats only for non-test posts
+      if (!isTest) {
+        await Stats.findOneAndUpdate(
+          {},
+          { lastChannelPost: new Date() },
+          { upsert: true }
+        );
+      }
     }
     
     return { imageMessageId, fileMessageId, results };
@@ -415,6 +417,50 @@ function isDocumentAnImage(filename) {
   return isImageFileType(filename);
 }
 
+// Download and re-upload file as photo
+async function downloadAndSendAsPhoto(channelId, fileId, fileName, caption = null) {
+  try {
+    // Get file info from Telegram
+    const fileInfo = await bot.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+    
+    // Download the file
+    const https = require('https');
+    const http = require('http');
+    
+    return new Promise((resolve, reject) => {
+      const protocol = fileUrl.startsWith('https:') ? https : http;
+      
+      protocol.get(fileUrl, (response) => {
+        if (response.statusCode !== 200) {
+          reject(new Error(`Download failed: ${response.statusCode}`));
+          return;
+        }
+        
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', async () => {
+          try {
+            const buffer = Buffer.concat(chunks);
+            
+            // Send the buffer as photo
+            const photoMessage = await bot.sendPhoto(channelId, buffer, {
+              caption: caption,
+              filename: fileName
+            });
+            
+            resolve(photoMessage);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      }).on('error', reject);
+    });
+  } catch (error) {
+    throw new Error(`Download and send failed: ${error.message}`);
+  }
+}
+
 async function finishBulkUpload(userId) {
   const session = global.bulkUploadSessions?.[userId];
   if (!session) return;
@@ -505,13 +551,11 @@ async function sendRewardFile(userId, reward, message) {
     
     if (reward.isImageFile || isImageByFilename) {
       try {
-        // Try to send as photo first
-        await bot.sendPhoto(userId, reward.imagePath || reward.filePath, {
-          caption: `${reward.fileName} - Level ${reward.level}`
-        });
-      } catch (photoError) {
-        console.log('Photo send failed for user reward, sending as document:', photoError.message);
-        // Fallback to document if photo fails
+        // Download and re-upload as photo for better display
+        await downloadAndSendAsPhoto(userId, reward.imagePath || reward.filePath, reward.fileName, `${reward.fileName} - Level ${reward.level}`);
+      } catch (downloadError) {
+        console.log('Photo download failed for user reward, sending as document:', downloadError.message);
+        // Fallback to document if download fails
         await bot.sendDocument(userId, reward.imagePath || reward.filePath, {
           caption: `${reward.fileName} - Level ${reward.level}`
         });
