@@ -194,7 +194,7 @@ async function checkUserBlocked(userId) {
   return user && user.isBlocked;
 }
 
-// Fixed sendToChannel function with proper image detection and error handling
+// Fixed sendToChannel function - forces images to be sent as photos
 async function sendToChannel(communityCount = 0, isTest = false) {
   try {
     const rewardLevel = Math.floor(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
@@ -214,53 +214,59 @@ async function sendToChannel(communityCount = 0, isTest = false) {
     let fileMessageId = null;
     let results = [];
     
-    // Send image first with proper error handling
+    // Send image first - FORCE as photo if it's an image file
     if (imageReward) {
       try {
         const fileToSend = imageReward.imagePath || imageReward.filePath;
-        console.log(`Attempting to send image: ${imageReward.fileName}`);
+        console.log(`Attempting to send image as photo: ${imageReward.fileName}`);
         
-        // Get file info to check if it's actually a photo
-        const fileInfo = await bot.getFile(fileToSend);
-        const isActualImage = fileInfo.file_path && 
-          (fileInfo.file_path.match(/\.(jpg|jpeg|png|gif|webp)$/i) ||
-           imageReward.fileName.match(/\.(jpg|jpeg|png|gif|webp)$/i));
+        // Always try to send as photo first for image files, regardless of how they were uploaded
+        const imageMessage = await bot.sendPhoto(CHANNEL_ID, fileToSend);
+        imageMessageId = imageMessage.message_id;
+        results.push(`✅ Image sent as photo: ${imageReward.fileName}`);
         
-        if (isActualImage) {
-          const imageMessage = await bot.sendPhoto(CHANNEL_ID, fileToSend);
-          imageMessageId = imageMessage.message_id;
-          results.push(`✅ Image sent: ${imageReward.fileName}`);
-        } else {
-          // Send as document if not a valid image
-          const imageMessage = await bot.sendDocument(CHANNEL_ID, fileToSend);
-          imageMessageId = imageMessage.message_id;
-          results.push(`📄 Image sent as document: ${imageReward.fileName}`);
-        }
-      } catch (error) {
-        console.error('Error sending image:', error);
-        results.push(`❌ Image failed: ${error.message}`);
-        
-        // Fallback: try to send as document
+      } catch (photoError) {
+        console.error('Photo send failed:', photoError.message);
         try {
+          // Only fallback to document if photo absolutely fails
           const fileToSend = imageReward.imagePath || imageReward.filePath;
           const imageMessage = await bot.sendDocument(CHANNEL_ID, fileToSend);
           imageMessageId = imageMessage.message_id;
-          results.push(`📄 Image sent as document (fallback): ${imageReward.fileName}`);
-        } catch (fallbackError) {
-          console.error('Fallback document send failed:', fallbackError);
-          results.push(`❌ Image fallback failed: ${fallbackError.message}`);
+          results.push(`📄 Image sent as document (photo failed): ${imageReward.fileName}`);
+        } catch (docError) {
+          console.error('Document fallback also failed:', docError);
+          results.push(`❌ Image failed completely: ${docError.message}`);
         }
       }
     }
     
-    // Send file second
+    // Send file second - check if it's actually an image that should be sent as photo
     if (fileReward) {
       try {
-        const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
-        fileMessageId = fileMessage.message_id;
-        results.push(`📁 File sent: ${fileReward.fileName}`);
+        const isImageByFilename = isDocumentAnImage(fileReward.fileName);
+        
+        if (isImageByFilename) {
+          // This "file" is actually an image, force send as photo
+          console.log(`Attempting to send file as photo: ${fileReward.fileName}`);
+          try {
+            const fileMessage = await bot.sendPhoto(CHANNEL_ID, fileReward.filePath);
+            fileMessageId = fileMessage.message_id;
+            results.push(`✅ File sent as photo: ${fileReward.fileName}`);
+          } catch (photoError) {
+            console.error('Photo send failed for file:', photoError.message);
+            // Fallback to document
+            const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
+            fileMessageId = fileMessage.message_id;
+            results.push(`📄 File sent as document (photo failed): ${fileReward.fileName}`);
+          }
+        } else {
+          // Not an image, send as document normally
+          const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
+          fileMessageId = fileMessage.message_id;
+          results.push(`📁 File sent as document: ${fileReward.fileName}`);
+        }
       } catch (error) {
-        console.error('Error sending file:', error);
+        console.error('Error sending file reward:', error);
         results.push(`❌ File failed: ${error.message}`);
       }
     }
@@ -404,6 +410,11 @@ function isImageFileType(filename) {
   return imageExtensions.includes(ext);
 }
 
+// Check if a document file is actually an image based on filename
+function isDocumentAnImage(filename) {
+  return isImageFileType(filename);
+}
+
 async function finishBulkUpload(userId) {
   const session = global.bulkUploadSessions?.[userId];
   if (!session) return;
@@ -489,13 +500,17 @@ async function sendRewardFile(userId, reward, message) {
   try {
     await bot.sendMessage(userId, message);
     
-    if (reward.isImageFile) {
+    // Check if this is an image file based on filename (even if uploaded as document)
+    const isImageByFilename = isDocumentAnImage(reward.fileName);
+    
+    if (reward.isImageFile || isImageByFilename) {
       try {
         // Try to send as photo first
         await bot.sendPhoto(userId, reward.imagePath || reward.filePath, {
           caption: `${reward.fileName} - Level ${reward.level}`
         });
       } catch (photoError) {
+        console.log('Photo send failed for user reward, sending as document:', photoError.message);
         // Fallback to document if photo fails
         await bot.sendDocument(userId, reward.imagePath || reward.filePath, {
           caption: `${reward.fileName} - Level ${reward.level}`
