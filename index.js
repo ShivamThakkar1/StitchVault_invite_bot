@@ -27,7 +27,7 @@ const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(i
 const INVITES_PER_REWARD = parseInt(process.env.INVITES_PER_REWARD) || 2;
 const BOT_USERNAME = process.env.BOT_USERNAME || 'StitchVaultBot';
 
-// Initialize bot
+// Initialize bot with better error handling
 const bot = new TelegramBot(BOT_TOKEN, { 
   polling: {
     interval: 1000,
@@ -36,7 +36,8 @@ const bot = new TelegramBot(BOT_TOKEN, {
       timeout: 10,
       allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member', 'document', 'photo']
     }
-  }
+  },
+  onlyFirstMatch: true // Prevent duplicate message handling
 });
 
 // Initialize bulk upload sessions
@@ -879,25 +880,30 @@ async function periodicMembershipCheck() {
           
           user.joinedChannel = true;
           
-          if (user.referredBy && !user.referralCounted) {
-            const referrer = await countReferral(user);
+          // Prevent duplicate welcome messages
+          if (!wasWelcomeRecentlySent(user.userId)) {
+            markWelcomeSent(user.userId);
             
-            if (referrer) {
+            if (user.referredBy && !user.referralCounted) {
+              const referrer = await countReferral(user);
+              
+              if (referrer) {
+                bot.sendMessage(user.userId, 
+                  `🎉 Welcome to StitchVault community!\n\n` +
+                  `✅ Your referral has been counted toward our community goal!\n` +
+                  `🎨 Help us unlock more exclusive design collections!\n\n` +
+                  `🔗 Get your invite link: /link\n` +
+                  `📊 Check community progress: /stats`
+                ).catch(() => {});
+              }
+            } else {
               bot.sendMessage(user.userId, 
-                `🎉 Welcome to StitchVault community!\n\n` +
-                `✅ Your referral has been counted toward our community goal!\n` +
-                `🎨 Help us unlock more exclusive design collections!\n\n` +
+                `🎉 Welcome to StitchVault!\n\n` +
+                `🎨 Start helping our community unlock exclusive designs!\n\n` +
                 `🔗 Get your invite link: /link\n` +
                 `📊 Check community progress: /stats`
               ).catch(() => {});
             }
-          } else {
-            bot.sendMessage(user.userId, 
-              `🎉 Welcome to StitchVault!\n\n` +
-              `🎨 Start helping our community unlock exclusive designs!\n\n` +
-              `🔗 Get your invite link: /link\n` +
-              `📊 Check community progress: /stats`
-            ).catch(() => {});
           }
           
           await user.save();
@@ -1709,21 +1715,28 @@ bot.on('chat_member', async (chatMember) => {
       if (['member', 'administrator', 'creator'].includes(status)) {
         user.joinedChannel = true;
         
-        if (!wasChannelMember && user.referredBy && !user.referralCounted) {
-          await countReferral(user);
-          
-          bot.sendMessage(userId, 
-            `🎉 Welcome to StitchVault community!\n\n` +
-            `✅ Your referral counted toward our community goal!\n` +
-            `🎨 Help us unlock more exclusive designs!\n\n` +
-            `🔗 Get your invite link: /link`
-          ).catch(() => {});
-        } else if (!wasChannelMember) {
-          bot.sendMessage(userId, 
-            `🎉 Welcome to StitchVault!\n\n` +
-            `🎨 Help our community unlock exclusive designs!\n\n` +
-            `🔗 Get your invite link: /link`
-          ).catch(() => {});
+        if (!wasChannelMember) {
+          // Prevent duplicate welcome messages
+          if (!wasWelcomeRecentlySent(userId)) {
+            markWelcomeSent(userId);
+            
+            if (user.referredBy && !user.referralCounted) {
+              await countReferral(user);
+              
+              bot.sendMessage(userId, 
+                `🎉 Welcome to StitchVault community!\n\n` +
+                `✅ Your referral counted toward our community goal!\n` +
+                `🎨 Help us unlock more exclusive designs!\n\n` +
+                `🔗 Get your invite link: /link`
+              ).catch(() => {});
+            } else {
+              bot.sendMessage(userId, 
+                `🎉 Welcome to StitchVault!\n\n` +
+                `🎨 Help our community unlock exclusive designs!\n\n` +
+                `🔗 Get your invite link: /link`
+              ).catch(() => {});
+            }
+          }
         }
       } else if (['left', 'kicked'].includes(status)) {
         user.joinedChannel = false;
@@ -1736,10 +1749,45 @@ bot.on('chat_member', async (chatMember) => {
   }
 });
 
-// Error handling
+// Error handling with restart capability
 bot.on('polling_error', (error) => {
-  console.error('Polling error:', error);
+  console.error('Polling error:', error.message);
+  
+  if (error.code === 'ETELEGRAM' && error.message.includes('409')) {
+    console.log('🔄 Detected polling conflict. Stopping current instance...');
+    bot.stopPolling().then(() => {
+      console.log('✅ Polling stopped. Please make sure no other instances are running.');
+      console.log('💡 To fix: Kill all other bot processes, then restart this one.');
+      process.exit(1);
+    }).catch((stopError) => {
+      console.error('Error stopping polling:', stopError);
+      process.exit(1);
+    });
+  }
 });
+
+// Track recent welcome messages to prevent duplicates
+const recentWelcomes = new Map();
+const WELCOME_COOLDOWN = 10000; // 10 seconds cooldown
+
+// Helper function to check if welcome was recently sent
+function wasWelcomeRecentlySent(userId) {
+  const lastWelcome = recentWelcomes.get(userId);
+  if (lastWelcome && (Date.now() - lastWelcome) < WELCOME_COOLDOWN) {
+    return true;
+  }
+  return false;
+}
+
+// Helper function to mark welcome as sent
+function markWelcomeSent(userId) {
+  recentWelcomes.set(userId, Date.now());
+  
+  // Clean up old entries
+  setTimeout(() => {
+    recentWelcomes.delete(userId);
+  }, WELCOME_COOLDOWN);
+}
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
