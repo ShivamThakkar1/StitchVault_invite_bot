@@ -209,14 +209,7 @@ async function sendToChannel(communityCount = 0) {
     // Send image first (if available)
     if (imageReward) {
       try {
-        const imageMessage = await bot.sendPhoto(CHANNEL_ID, imageReward.imagePath || imageReward.filePath, {
-          caption: `🎨 New StitchVault Design Collection!\n\n` +
-                  `🏆 Unlocked by our amazing community!\n` +
-                  `👥 Community Referrals: ${communityCount}\n` +
-                  `🔥 Help us unlock more exclusive designs!\n\n` +
-                  `🚀 Join the referral program: https://t.me/${BOT_USERNAME}\n` +
-                  `📱 Share StitchVault with friends to unlock premium content!`
-        });
+        const imageMessage = await bot.sendPhoto(CHANNEL_ID, imageReward.imagePath || imageReward.filePath);
         imageMessageId = imageMessage.message_id;
         console.log(`Community image sent to channel for ${communityCount} referrals`);
       } catch (error) {
@@ -227,15 +220,7 @@ async function sendToChannel(communityCount = 0) {
     // Send file second (if available)
     if (fileReward) {
       try {
-        const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath, {
-          caption: `📁 ${fileReward.fileName}\n` +
-                  `🎁 Community Reward - Level ${rewardLevel}\n\n` +
-                  `🌟 Unlocked by ${communityCount} community referrals!\n` +
-                  `💎 Want more exclusive design collections?\n` +
-                  `👥 Every 2 referrals unlocks new premium content!\n\n` +
-                  `🚀 Start earning: https://t.me/${BOT_USERNAME}\n` +
-                  `📢 Share StitchVault and help grow our creative community!`
-        });
+        const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
         fileMessageId = fileMessage.message_id;
         console.log(`Community file sent to channel for ${communityCount} referrals`);
       } catch (error) {
@@ -1074,8 +1059,538 @@ bot.onText(/\/reset_community/, async (msg) => {
   }
 });
 
-// Manual community post
-bot.onText(/\/send_channel/, async (msg) => {
+// Manual community post with specific level
+bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const level = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const imageReward = await Reward.findOne({ level, isImageFile: true });
+    const fileReward = await Reward.findOne({ level, isImageFile: false });
+    
+    if (!imageReward && !fileReward) {
+      return bot.sendMessage(chatId, `❌ No rewards found for level ${level}`);
+    }
+    
+    const postId = `${Date.now()}_${level}`;
+    let imageMessageId = null;
+    let fileMessageId = null;
+    
+    // Send image first (if available)
+    if (imageReward) {
+      try {
+        const imageMessage = await bot.sendPhoto(CHANNEL_ID, imageReward.imagePath || imageReward.filePath);
+        imageMessageId = imageMessage.message_id;
+      } catch (error) {
+        console.error('Error sending image:', error);
+      }
+    }
+    
+    // Send file second (if available)
+    if (fileReward) {
+      try {
+        const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
+        fileMessageId = fileMessage.message_id;
+      } catch (error) {
+        console.error('Error sending file:', error);
+      }
+    }
+    
+    // Track the post
+    const channelPost = new ChannelPost({
+      postId,
+      rewardLevel: level,
+      imageMessageId,
+      fileMessageId,
+      communityReferrals: 0 // Manual post
+    });
+    await channelPost.save();
+    
+    bot.sendMessage(chatId, 
+      `✅ Content sent to @${CHANNEL_USERNAME}!\n\n` +
+      `🎯 Level: ${level}\n` +
+      `🖼️ Image: ${imageMessageId ? '✅' : '❌'}\n` +
+      `📁 File: ${fileMessageId ? '✅' : '❌'}`
+    );
+    
+  } catch (error) {
+    console.error('Send channel error:', error);
+    bot.sendMessage(chatId, '❌ Error sending to channel.');
+  }
+});
+
+// Channel post history
+bot.onText(/\/channel_history/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const posts = await ChannelPost.find().sort({ sentAt: -1 }).limit(10);
+    
+    if (posts.length === 0) {
+      return bot.sendMessage(chatId, '📭 No channel posts found.');
+    }
+    
+    let message = `📢 Recent Channel Posts:\n\n`;
+    
+    posts.forEach((post, index) => {
+      const postType = post.communityReferrals === 0 ? 'Manual' : `Community (${post.communityReferrals} refs)`;
+      message += 
+        `${index + 1}. Level ${post.rewardLevel} (${postType})\n` +
+        `📅 ${post.sentAt.toLocaleString()}\n` +
+        `🖼️ Image: ${post.imageMessageId ? '✅' : '❌'}\n` +
+        `📁 File: ${post.fileMessageId ? '✅' : '❌'}\n\n`;
+    });
+    
+    await bot.sendMessage(chatId, message);
+    
+  } catch (error) {
+    console.error('Channel history error:', error);
+    bot.sendMessage(chatId, '❌ Error fetching channel history.');
+  }
+});
+
+// Test channel post
+bot.onText(/\/test_channel (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const level = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const imageReward = await Reward.findOne({ level, isImageFile: true });
+    const fileReward = await Reward.findOne({ level, isImageFile: false });
+    
+    if (!imageReward && !fileReward) {
+      return bot.sendMessage(chatId, `❌ No rewards found for level ${level}`);
+    }
+    
+    // Send to admin first as test
+    let testMessage = `🧪 Test Channel Post - Level ${level}:\n\n`;
+    
+    if (imageReward) {
+      await bot.sendPhoto(chatId, imageReward.imagePath || imageReward.filePath, {
+        caption: `🖼️ Test Image: ${imageReward.fileName}`
+      });
+    }
+    
+    if (fileReward) {
+      await bot.sendDocument(chatId, fileReward.filePath, {
+        caption: `📁 Test File: ${fileReward.fileName}`
+      });
+    }
+    
+    bot.sendMessage(chatId, testMessage + 'Use /send_channel ' + level + ' to post to channel');
+    
+  } catch (error) {
+    console.error('Test channel error:', error);
+    bot.sendMessage(chatId, '❌ Error testing channel post.');
+  }
+});
+
+// Clear all rewards for a level
+bot.onText(/\/clear_level (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const level = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const result = await Reward.deleteMany({ level });
+    
+    bot.sendMessage(chatId, 
+      `🗑️ Cleared level ${level}!\n` +
+      `📦 Deleted ${result.deletedCount} rewards`
+    );
+    
+  } catch (error) {
+    console.error('Clear level error:', error);
+    bot.sendMessage(chatId, '❌ Error clearing level.');
+  }
+});
+
+// Delete specific reward
+bot.onText(/\/delete_reward (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const rewardId = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const reward = await Reward.findOneAndDelete({ rewardId });
+    
+    if (!reward) {
+      return bot.sendMessage(chatId, '❌ Reward not found.');
+    }
+    
+    bot.sendMessage(chatId, 
+      `✅ Reward deleted successfully!\n` +
+      `📝 File: ${reward.fileName}\n` +
+      `🎯 Level: ${reward.level}\n` +
+      `🎨 Type: ${reward.isImageFile ? 'Image' : 'File'}`
+    );
+    
+  } catch (error) {
+    console.error('Delete reward error:', error);
+    bot.sendMessage(chatId, '❌ Error deleting reward.');
+  }
+});
+
+// Enhanced reward management - add single reward
+bot.onText(/\/reward (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const level = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  if (!msg.reply_to_message || (!msg.reply_to_message.document && !msg.reply_to_message.photo)) {
+    return bot.sendMessage(chatId, '❌ Please reply to a file or image with /reward <level>');
+  }
+  
+  try {
+    let fileName, fileId, isImageFile;
+    
+    if (msg.reply_to_message.document) {
+      const document = msg.reply_to_message.document;
+      fileName = document.file_name;
+      fileId = document.file_id;
+      isImageFile = isImageFileType(fileName);
+    } else if (msg.reply_to_message.photo) {
+      const photo = msg.reply_to_message.photo[msg.reply_to_message.photo.length - 1];
+      fileName = msg.reply_to_message.caption || `image_${level}.jpg`;
+      fileId = photo.file_id;
+      isImageFile = true;
+    }
+    
+    const reward = new Reward({
+      rewardId: Date.now(),
+      level,
+      fileName,
+      filePath: fileId,
+      imageName: isImageFile ? fileName : null,
+      imagePath: isImageFile ? fileId : null,
+      description: `StitchVault Level ${level} ${isImageFile ? 'preview' : 'download'}`,
+      addedBy: userId,
+      isImageFile: isImageFile
+    });
+    
+    await reward.save();
+    
+    bot.sendMessage(chatId, 
+      `✅ Reward added successfully!\n` +
+      `📁 File: ${fileName}\n` +
+      `🎯 Level: ${level}\n` +
+      `🎨 Type: ${isImageFile ? 'Image Preview' : 'Download File'}\n` +
+      `🆔 Reward ID: ${reward.rewardId}`
+    );
+    
+  } catch (error) {
+    console.error('Add reward error:', error);
+    bot.sendMessage(chatId, '❌ Error adding reward.');
+  }
+});
+
+// List all rewards
+bot.onText(/\/rewards/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const rewards = await Reward.find().sort({ level: 1, isImageFile: -1 });
+    
+    if (rewards.length === 0) {
+      return bot.sendMessage(chatId, '❌ No rewards found.');
+    }
+    
+    let message = `🎁 StitchVault Rewards List:\n\n`;
+    
+    rewards.forEach(reward => {
+      const typeIcon = reward.isImageFile ? '🖼️' : '📁';
+      const typeText = reward.isImageFile ? 'Image' : 'File';
+      
+      message += 
+        `${typeIcon} Level ${reward.level} (${typeText})\n` +
+        `📝 File: ${reward.fileName}\n` +
+        `🆔 ID: ${reward.rewardId}\n` +
+        `📅 Added: ${reward.addedAt.toDateString()}\n\n`;
+    });
+    
+    await bot.sendMessage(chatId, message);
+    
+  } catch (error) {
+    console.error('Rewards list error:', error);
+    bot.sendMessage(chatId, '❌ Error fetching rewards.');
+  }
+});
+
+// Block/Unblock users  
+bot.onText(/\/block (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const targetUserId = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const user = await User.findOneAndUpdate(
+      { userId: targetUserId },
+      { isBlocked: true },
+      { new: true }
+    );
+    
+    if (!user) {
+      return bot.sendMessage(chatId, '❌ User not found.');
+    }
+    
+    bot.sendMessage(chatId, `🚫 User ${user.firstName} (${targetUserId}) has been blocked.`);
+    
+    bot.sendMessage(targetUserId, 
+      '🚫 You have been temporarily restricted from using this bot. Contact support if you believe this is an error.'
+    ).catch(() => {});
+    
+  } catch (error) {
+    console.error('Block user error:', error);
+    bot.sendMessage(chatId, '❌ Error blocking user.');
+  }
+});
+
+bot.onText(/\/unblock (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const targetUserId = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const user = await User.findOneAndUpdate(
+      { userId: targetUserId },
+      { isBlocked: false },
+      { new: true }
+    );
+    
+    if (!user) {
+      return bot.sendMessage(chatId, '❌ User not found.');
+    }
+    
+    bot.sendMessage(chatId, `✅ User ${user.firstName} (${targetUserId}) has been unblocked.`);
+    
+    bot.sendMessage(targetUserId, 
+      '✅ You have been unblocked and can now use the bot normally!'
+    ).catch(() => {});
+    
+  } catch (error) {
+    console.error('Unblock user error:', error);
+    bot.sendMessage(chatId, '❌ Error unblocking user.');
+  }
+});
+
+// Broadcast message
+bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const message = match[1];
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const users = await User.find({ isBlocked: false });
+    let sent = 0;
+    let failed = 0;
+    
+    bot.sendMessage(chatId, `📤 Starting broadcast to ${users.length} users...`);
+    
+    for (const user of users) {
+      try {
+        await bot.sendMessage(user.userId, `📢 ${message}`);
+        sent++;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        failed++;
+      }
+    }
+    
+    bot.sendMessage(chatId, 
+      `📊 Broadcast completed!\n` +
+      `✅ Sent: ${sent}\n` +
+      `❌ Failed: ${failed}`
+    );
+    
+  } catch (error) {
+    console.error('Broadcast error:', error);
+    bot.sendMessage(chatId, '❌ Error sending broadcast.');
+  }
+});
+
+// List users
+bot.onText(/\/users(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const page = parseInt(match[1]) || 1;
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const limit = 10;
+    const skip = (page - 1) * limit;
+    
+    const users = await User.find()
+      .sort({ joinedAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    
+    const totalUsers = await User.countDocuments();
+    const totalPages = Math.ceil(totalUsers / limit);
+    
+    let message = `👥 Users List (Page ${page}/${totalPages}):\n\n`;
+    
+    users.forEach((user, index) => {
+      const referralStatus = user.referredBy ? 
+        (user.referralCounted ? '✅' : '⏳') : '';
+      
+      message += 
+        `${skip + index + 1}. ${user.firstName} ${user.lastName || ''}\n` +
+        `🆔 ${user.userId} | 👥 ${user.inviteCount} invites ${referralStatus}\n` +
+        `📱 ${user.joinedChannel ? '✅' : '❌'} | 🚫 ${user.isBlocked ? 'Blocked' : 'Active'}\n\n`;
+    });
+    
+    const keyboard = {
+      inline_keyboard: []
+    };
+    
+    const navButtons = [];
+    if (page > 1) {
+      navButtons.push({ text: '⬅️ Previous', callback_data: `users_page_${page - 1}` });
+    }
+    if (page < totalPages) {
+      navButtons.push({ text: 'Next ➡️', callback_data: `users_page_${page + 1}` });
+    }
+    
+    if (navButtons.length > 0) {
+      keyboard.inline_keyboard.push(navButtons);
+    }
+    
+    await bot.sendMessage(chatId, message, { 
+      reply_markup: keyboard.inline_keyboard.length > 0 ? keyboard : undefined 
+    });
+    
+  } catch (error) {
+    console.error('Users list error:', error);
+    bot.sendMessage(chatId, '❌ Error fetching users list.');
+  }
+});
+
+// Get user info  
+bot.onText(/\/user (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const targetUserId = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const user = await User.findOne({ userId: targetUserId });
+    
+    if (!user) {
+      return bot.sendMessage(chatId, '❌ User not found.');
+    }
+    
+    const referredUsers = await User.countDocuments({ 
+      referredBy: targetUserId,
+      referralCounted: true 
+    });
+    const pendingReferrals = await User.countDocuments({ 
+      referredBy: targetUserId,
+      referralCounted: false 
+    });
+    const referrer = user.referredBy ? await User.findOne({ userId: user.referredBy }) : null;
+    
+    const message = 
+      `👤 User Information:\n\n` +
+      `🆔 User ID: ${user.userId}\n` +
+      `👤 Name: ${user.firstName} ${user.lastName || ''}\n` +
+      `🔗 Username: ${user.username ? '@' + user.username : 'Not set'}\n` +
+      `📅 Joined: ${user.joinedAt.toDateString()}\n` +
+      `📅 Last Active: ${user.lastActivity.toDateString()}\n\n` +
+      `📊 Statistics:\n` +
+      `👥 Invites: ${user.inviteCount}\n` +
+      `💰 Total Earned: ${user.totalEarned}\n` +
+      `🏆 Last Reward: Level ${user.lastRewardLevel}\n` +
+      `🎁 Bonus Received: ${user.bonusReceived ? '✅' : '❌'}\n\n` +
+      `📱 Channel Status: ${user.joinedChannel ? '✅ Member' : '❌ Not Member'}\n` +
+      `🚫 Status: ${user.isBlocked ? '🚫 Blocked' : '✅ Active'}\n\n` +
+      `🔗 Referral Info:\n` +
+      `📝 Code: ${user.referralCode}\n` +
+      `👤 Referred by: ${referrer ? `${referrer.firstName} (${referrer.userId})` : 'Direct join'}\n` +
+      `✅ Referral counted: ${user.referralCounted ? 'Yes' : 'No'}\n` +
+      `👥 Confirmed referrals: ${referredUsers}\n` +
+      `⏳ Pending referrals: ${pendingReferrals}`;
+    
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: user.isBlocked ? '✅ Unblock' : '🚫 Block', callback_data: `admin_${user.isBlocked ? 'unblock' : 'block'}_${user.userId}` },
+          { text: '🔄 Reset Stats', callback_data: `admin_reset_${user.userId}` }
+        ]
+      ]
+    };
+    
+    await bot.sendMessage(chatId, message, { reply_markup: keyboard });
+    
+  } catch (error) {
+    console.error('User info error:', error);
+    bot.sendMessage(chatId, '❌ Error fetching user information.');
+  }
+});
+
+// Export backup
+bot.onText(/\/backup/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const users = await User.find({}, '-_id -__v').lean();
+    const rewards = await Reward.find({}, '-_id -__v').lean();
+    const stats = await Stats.findOne({}, '-_id -__v').lean();
+    const channelPosts = await ChannelPost.find({}, '-_id -__v').lean();
+    
+    const backup = {
+      exportDate: new Date().toISOString(),
+      botName: 'StitchVault',
+      users,
+      rewards,
+      stats,
+      channelPosts
+    };
+    
+    const backupData = JSON.stringify(backup, null, 2);
+    const fileName = `stitchvault_backup_${new Date().toISOString().split('T')[0]}.json`;
+    
+    await bot.sendDocument(chatId, Buffer.from(backupData), {
+      filename: fileName,
+      caption: `📁 StitchVault backup generated on ${new Date().toLocaleString()}`
+    });
+    
+  } catch (error) {
+    console.error('Backup error:', error);
+    bot.sendMessage(chatId, '❌ Error creating backup.');
+  }
+});
+
+// Manual community post (simplified version without level parameter)
+bot.onText(/\/send_channel$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   
