@@ -277,7 +277,7 @@ async function sendToChannel(memberCount = 0, isTest = false) {
         const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
         const needed = Math.max(0, nextMilestone - memberCount);
         
-        const milestoneMessage = `🎯 Next content unlock: ${needed} more members needed! Current: ${memberCount}/${nextMilestone}`;
+        const milestoneMessage = `🎯 Next content unlock: ${nextMilestone} members!\n👥 Current: ${memberCount}/${nextMilestone} — just ${needed} more to go!\n✨ Don’t miss out — invite your friends now!`;
         
         await bot.sendMessage(CHANNEL_ID, milestoneMessage);
         results.push(`📊 Milestone message sent: ${needed} more needed`);
