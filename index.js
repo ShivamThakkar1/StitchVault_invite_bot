@@ -26,6 +26,8 @@ const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || 'stitchvault';
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id)) : [];
 const INVITES_PER_REWARD = parseInt(process.env.INVITES_PER_REWARD) || 2;
 const BOT_USERNAME = process.env.BOT_USERNAME || 'StitchVaultBot';
+// Add configurable auto post interval (in hours)
+const AUTO_POST_HOURS = parseInt(process.env.AUTO_POST_HOURS) || 48;
 
 // Initialize bot
 const bot = new TelegramBot(BOT_TOKEN, { 
@@ -115,7 +117,7 @@ const channelPostSchema = new mongoose.Schema({
 
 const ChannelPost = mongoose.model('ChannelPost', channelPostSchema);
 
-// Stats Schema with community referral count
+// Stats Schema - now tracks total channel members instead of just referrals
 const statsSchema = new mongoose.Schema({
   totalUsers: { type: Number, default: 0 },
   totalInvites: { type: Number, default: 0 },
@@ -123,7 +125,7 @@ const statsSchema = new mongoose.Schema({
   channelMembers: { type: Number, default: 0 },
   lastChannelPost: { type: Date, default: null },
   pendingReferrals: { type: Number, default: 0 },
-  communityReferralCount: { type: Number, default: 0 },
+  communityMemberCount: { type: Number, default: 0 }, // Changed from referral count to member count
   lastUpdated: { type: Date, default: Date.now }
 });
 
@@ -161,6 +163,7 @@ async function updateStats() {
     { $group: { _id: null, total: { $sum: '$inviteCount' } } }
   ]);
   const totalRewards = await Reward.countDocuments();
+  const channelMembers = await User.countDocuments({ joinedChannel: true });
   const pendingReferrals = await User.countDocuments({ 
     referredBy: { $exists: true }, 
     referralCounted: false 
@@ -172,7 +175,9 @@ async function updateStats() {
       totalUsers,
       totalInvites: totalInvites[0]?.total || 0,
       totalRewards,
+      channelMembers,
       pendingReferrals,
+      communityMemberCount: channelMembers, // Update member count
       lastUpdated: new Date()
     },
     { upsert: true }
@@ -194,10 +199,10 @@ async function checkUserBlocked(userId) {
   return user && user.isBlocked;
 }
 
-// Fixed sendToChannel function - downloads and re-uploads images as photos
-async function sendToChannel(communityCount = 0, isTest = false) {
+// Enhanced sendToChannel function with milestone message
+async function sendToChannel(memberCount = 0, isTest = false) {
   try {
-    const rewardLevel = Math.floor(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+    const rewardLevel = Math.floor(memberCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
     
     if (rewardLevel === 0 && !isTest) return;
     
@@ -220,7 +225,6 @@ async function sendToChannel(communityCount = 0, isTest = false) {
         const fileToSend = imageReward.imagePath || imageReward.filePath;
         console.log(`Downloading and sending image as photo: ${imageReward.fileName}`);
         
-        // Download and re-upload as photo
         const imageMessage = await downloadAndSendAsPhoto(CHANNEL_ID, fileToSend, imageReward.fileName);
         imageMessageId = imageMessage.message_id;
         results.push(`✅ Image downloaded and sent as photo: ${imageReward.fileName}`);
@@ -228,7 +232,6 @@ async function sendToChannel(communityCount = 0, isTest = false) {
       } catch (downloadError) {
         console.error('Download and photo send failed:', downloadError.message);
         try {
-          // Fallback to sending as document
           const fileToSend = imageReward.imagePath || imageReward.filePath;
           const imageMessage = await bot.sendDocument(CHANNEL_ID, fileToSend);
           imageMessageId = imageMessage.message_id;
@@ -246,7 +249,6 @@ async function sendToChannel(communityCount = 0, isTest = false) {
         const isImageByFilename = isDocumentAnImage(fileReward.fileName);
         
         if (isImageByFilename) {
-          // This "file" is actually an image, download and send as photo
           console.log(`Downloading and sending file as photo: ${fileReward.fileName}`);
           try {
             const fileMessage = await downloadAndSendAsPhoto(CHANNEL_ID, fileReward.filePath, fileReward.fileName);
@@ -254,13 +256,11 @@ async function sendToChannel(communityCount = 0, isTest = false) {
             results.push(`✅ File downloaded and sent as photo: ${fileReward.fileName}`);
           } catch (downloadError) {
             console.error('Download and photo send failed for file:', downloadError.message);
-            // Fallback to document
             const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
             fileMessageId = fileMessage.message_id;
             results.push(`📄 File sent as document (download failed): ${fileReward.fileName}`);
           }
         } else {
-          // Not an image, send as document normally
           const fileMessage = await bot.sendDocument(CHANNEL_ID, fileReward.filePath);
           fileMessageId = fileMessage.message_id;
           results.push(`📁 File sent as document: ${fileReward.fileName}`);
@@ -271,6 +271,22 @@ async function sendToChannel(communityCount = 0, isTest = false) {
       }
     }
     
+    // Send milestone message after content
+    if ((imageMessageId || fileMessageId) && !isTest) {
+      try {
+        const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+        const needed = Math.max(0, nextMilestone - memberCount);
+        
+        const milestoneMessage = `🎯 Next content unlock: ${needed} more members needed! Current: ${memberCount}/${nextMilestone}`;
+        
+        await bot.sendMessage(CHANNEL_ID, milestoneMessage);
+        results.push(`📊 Milestone message sent: ${needed} more needed`);
+      } catch (error) {
+        console.error('Error sending milestone message:', error);
+        results.push(`❌ Milestone message failed: ${error.message}`);
+      }
+    }
+    
     // Track the post only if something was sent
     if (imageMessageId || fileMessageId) {
       const channelPost = new ChannelPost({
@@ -278,7 +294,7 @@ async function sendToChannel(communityCount = 0, isTest = false) {
         rewardLevel,
         imageMessageId,
         fileMessageId,
-        communityReferrals: isTest ? 0 : communityCount
+        communityReferrals: isTest ? 0 : memberCount
       });
       await channelPost.save();
       
@@ -303,19 +319,21 @@ async function sendToChannel(communityCount = 0, isTest = false) {
 // Export for admin_features.js
 global.sendToChannel = sendToChannel;
 
-// Check and send fallback content
+// Check and send fallback content - now configurable via environment variable
 async function checkAndSendFallback() {
   try {
     const stats = await Stats.findOne();
     const now = new Date();
     const lastPost = stats?.lastChannelPost;
     
-    if (!lastPost || (now - lastPost) >= (48 * 60 * 60 * 1000)) {
-      console.log('48 hours passed, sending fallback content...');
+    const fallbackIntervalMs = AUTO_POST_HOURS * 60 * 60 * 1000;
+    
+    if (!lastPost || (now - lastPost) >= fallbackIntervalMs) {
+      console.log(`${AUTO_POST_HOURS} hours passed, sending fallback content...`);
       
       const rewards = await Reward.find();
       if (rewards.length > 0) {
-        const currentCount = stats?.communityReferralCount || 0;
+        const currentCount = stats?.communityMemberCount || 0;
         await sendToChannel(currentCount);
         
         // Notify admins
@@ -323,8 +341,9 @@ async function checkAndSendFallback() {
           try {
             await bot.sendMessage(adminId, 
               `Fallback content sent to @${CHANNEL_USERNAME}!\n\n` +
-              `Last post: ${lastPost ? Math.floor((now - lastPost) / (1000 * 60 * 60)) : '48+'} hours ago\n` +
-              `Community referrals: ${currentCount}`
+              `Last post: ${lastPost ? Math.floor((now - lastPost) / (1000 * 60 * 60)) : `${AUTO_POST_HOURS}+`} hours ago\n` +
+              `Community members: ${currentCount}\n` +
+              `Auto-post interval: ${AUTO_POST_HOURS} hours`
             );
           } catch (error) {
             console.error(`Error notifying admin ${adminId}:`, error);
@@ -337,50 +356,56 @@ async function checkAndSendFallback() {
   }
 }
 
-// Community-based referral counting
-async function countReferral(user) {
-  if (!user.referredBy || user.referralCounted) return;
+// Enhanced community counting - now counts all channel joins
+async function countMember(user) {
+  // Count individual referral if applicable
+  if (user.referredBy && !user.referralCounted) {
+    const referrer = await User.findOne({ userId: user.referredBy });
+    if (referrer) {
+      referrer.inviteCount += 1;
+      referrer.totalEarned += 1;
+      await referrer.save();
+      
+      user.referralCounted = true;
+      await user.save();
+      
+      // Check individual reward
+      const rewardLevel = Math.floor(referrer.inviteCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+      if (rewardLevel > referrer.lastRewardLevel && rewardLevel > 0) {
+        await sendReward(referrer.userId, rewardLevel);
+        referrer.lastRewardLevel = rewardLevel;
+        await referrer.save();
+      }
+      
+      // Notify referrer
+      bot.sendMessage(referrer.userId, 
+        `Referral confirmed! ${user.firstName} joined StitchVault!\n\n` +
+        `Your referrals: ${referrer.inviteCount}\n` +
+        `Keep sharing to unlock more rewards!`
+      ).catch(() => {});
+    }
+  }
   
-  const referrer = await User.findOne({ userId: user.referredBy });
-  if (!referrer) return;
-  
-  // Count individual referral
-  referrer.inviteCount += 1;
-  referrer.totalEarned += 1;
-  await referrer.save();
-  
-  // Mark referral as counted
-  user.referralCounted = true;
-  await user.save();
-  
-  // Update community count
+  // Update community member count (for all joins, not just referrals)
   const stats = await Stats.findOneAndUpdate(
     {},
-    { $inc: { communityReferralCount: 1 } },
+    { $inc: { communityMemberCount: 1 } },
     { upsert: true, new: true }
   );
   
-  const communityCount = stats.communityReferralCount;
+  const memberCount = stats.communityMemberCount;
   
-  // Check individual reward
-  const rewardLevel = Math.floor(referrer.inviteCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-  if (rewardLevel > referrer.lastRewardLevel && rewardLevel > 0) {
-    await sendReward(referrer.userId, rewardLevel);
-    referrer.lastRewardLevel = rewardLevel;
-    await referrer.save();
-  }
-  
-  // Community milestone reached
-  if (communityCount % INVITES_PER_REWARD === 0) {
-    await sendToChannel(communityCount);
+  // Community milestone reached - check if we hit a milestone
+  if (memberCount % INVITES_PER_REWARD === 0) {
+    await sendToChannel(memberCount);
     
     // Notify admins
     for (const adminId of ADMIN_IDS) {
       try {
         await bot.sendMessage(adminId, 
-          `Community Milestone!\n\n` +
-          `Total referrals: ${communityCount}\n` +
-          `Latest: ${user.firstName} via ${referrer.firstName}\n` +
+          `Community Milestone Reached!\n\n` +
+          `Total members: ${memberCount}\n` +
+          `Latest join: ${user.firstName}${user.referredBy ? ' (referred)' : ' (direct)'}\n` +
           `Content sent to @${CHANNEL_USERNAME}`
         );
       } catch (error) {
@@ -389,15 +414,7 @@ async function countReferral(user) {
     }
   }
   
-  // Notify referrer
-  bot.sendMessage(referrer.userId, 
-    `Referral confirmed! ${user.firstName} joined StitchVault!\n\n` +
-    `Your referrals: ${referrer.inviteCount}\n` +
-    `Community total: ${communityCount}\n` +
-    `Next milestone: ${Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD} referrals`
-  ).catch(() => {});
-  
-  return referrer;
+  return memberCount;
 }
 
 // Bulk upload helper functions
@@ -412,7 +429,6 @@ function isImageFileType(filename) {
   return imageExtensions.includes(ext);
 }
 
-// Check if a document file is actually an image based on filename
 function isDocumentAnImage(filename) {
   return isImageFileType(filename);
 }
@@ -420,11 +436,9 @@ function isDocumentAnImage(filename) {
 // Download and re-upload file as photo
 async function downloadAndSendAsPhoto(channelId, fileId, fileName, caption = null) {
   try {
-    // Get file info from Telegram
     const fileInfo = await bot.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
     
-    // Download the file
     const https = require('https');
     const http = require('http');
     
@@ -443,7 +457,6 @@ async function downloadAndSendAsPhoto(channelId, fileId, fileName, caption = nul
           try {
             const buffer = Buffer.concat(chunks);
             
-            // Send the buffer as photo
             const photoMessage = await bot.sendPhoto(channelId, buffer, {
               caption: caption,
               filename: fileName
@@ -528,7 +541,6 @@ async function finishBulkUpload(userId) {
   await updateStats();
 }
 
-// Send reward function
 async function sendReward(userId, level) {
   try {
     const rewards = await Reward.find({ level });
@@ -546,16 +558,13 @@ async function sendRewardFile(userId, reward, message) {
   try {
     await bot.sendMessage(userId, message);
     
-    // Check if this is an image file based on filename (even if uploaded as document)
     const isImageByFilename = isDocumentAnImage(reward.fileName);
     
     if (reward.isImageFile || isImageByFilename) {
       try {
-        // Download and re-upload as photo for better display
         await downloadAndSendAsPhoto(userId, reward.imagePath || reward.filePath, reward.fileName, `${reward.fileName} - Level ${reward.level}`);
       } catch (downloadError) {
         console.log('Photo download failed for user reward, sending as document:', downloadError.message);
-        // Fallback to document if download fails
         await bot.sendDocument(userId, reward.imagePath || reward.filePath, {
           caption: `${reward.fileName} - Level ${reward.level}`
         });
@@ -570,12 +579,11 @@ async function sendRewardFile(userId, reward, message) {
   }
 }
 
-// Export for admin_features.js
 global.sendRewardFile = sendRewardFile;
 
 // BOT COMMANDS
 
-// Start command
+// Fixed Start command with better referral handling
 bot.onText(/\/start(.*)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -633,11 +641,11 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
       }
     }
     
-    // Get community stats
+    // Get community stats with FIXED calculation
     const stats = await Stats.findOne() || {};
-    const communityCount = stats.communityReferralCount || 0;
-    const nextMilestone = Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-    const needed = nextMilestone - communityCount;
+    const memberCount = stats.communityMemberCount || 0;
+    const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+    const needed = Math.max(0, nextMilestone - memberCount);
     
     let welcomeMessage;
     
@@ -646,16 +654,16 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
         `🎉 Welcome to StitchVault Community!\n\n` +
         `🔥 You were invited to join our creative community!\n` +
         `🎁 You received a welcome bonus!\n\n` +
-        `⚠️ **IMPORTANT: Join @${CHANNEL_USERNAME} first to help unlock community designs!**\n\n` +
-        `🏆 Community Progress: ${communityCount} referrals\n` +
-        `🎯 Next unlock: ${needed} more referrals needed\n\n` +
-        `💡 Every ${INVITES_PER_REWARD} community referrals unlocks exclusive content for everyone!`;
+        `👆 **Click the button below to join our channel and activate your referral!**\n\n` +
+        `🏆 Community Progress: ${memberCount} members\n` +
+        `🎯 Next unlock: ${needed} more members needed\n\n` +
+        `💡 Every ${INVITES_PER_REWARD} community members unlocks exclusive content for everyone!`;
     } else if (isNewUser) {
       welcomeMessage = 
         `🎉 Welcome to StitchVault Community!\n\n` +
         `🎁 You received a welcome bonus!\n` +
-        `📱 **Join @${CHANNEL_USERNAME} to access our design community!**\n\n` +
-        `🏆 Community Progress: ${communityCount} referrals\n` +
+        `📱 **Join our design community to get started!**\n\n` +
+        `🏆 Community Progress: ${memberCount} members\n` +
         `🎯 Next unlock: ${needed} more needed\n\n` +
         `🔗 Get your invite link: /link\n` +
         `❓ Need help: /help`;
@@ -663,8 +671,8 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
       welcomeMessage = 
         `👋 Welcome back to StitchVault, ${msg.from.first_name}!\n\n` +
         `👤 Your referrals: ${user.inviteCount}\n` +
-        `🏆 Community total: ${communityCount}\n` +
-        `🎯 Next unlock: ${needed} more referrals\n\n` +
+        `🏆 Community total: ${memberCount} members\n` +
+        `🎯 Next unlock: ${needed} more members\n\n` +
         `🔗 Your invite link: /link\n` +
         `📊 Your stats: /stats`;
     }
@@ -685,7 +693,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   }
 });
 
-// Link command
+// Fixed Link command with proper calculation
 bot.onText(/\/link/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -703,9 +711,9 @@ bot.onText(/\/link/, async (msg) => {
     }
     
     const stats = await Stats.findOne() || {};
-    const communityCount = stats.communityReferralCount || 0;
-    const nextMilestone = Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-    const needed = nextMilestone - communityCount;
+    const memberCount = stats.communityMemberCount || 0;
+    const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+    const needed = Math.max(0, nextMilestone - memberCount);
     
     const inviteLink = `https://t.me/${BOT_USERNAME}?start=${user.referralCode}`;
     
@@ -713,7 +721,7 @@ bot.onText(/\/link/, async (msg) => {
       `Your StitchVault Invite Link:\n` +
       `${inviteLink}\n\n` +
       `Your referrals: ${user.inviteCount}\n` +
-      `Community progress: ${communityCount} referrals\n` +
+      `Community progress: ${memberCount} members\n` +
       `Community goal: ${needed} more to unlock designs\n\n` +
       `Share to help unlock exclusive collections!\n` +
       `Friends must join @${CHANNEL_USERNAME} to count`;
@@ -733,7 +741,7 @@ bot.onText(/\/link/, async (msg) => {
   }
 });
 
-// Stats command
+// Fixed Stats command with proper calculation
 bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -751,12 +759,12 @@ bot.onText(/\/stats/, async (msg) => {
     }
     
     const stats = await Stats.findOne() || {};
-    const communityCount = stats.communityReferralCount || 0;
-    const nextMilestone = Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-    const needed = nextMilestone - communityCount;
+    const memberCount = stats.communityMemberCount || 0;
+    const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+    const needed = Math.max(0, nextMilestone - memberCount);
     
-    const userNext = Math.ceil(user.inviteCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-    const userNeeded = userNext - user.inviteCount;
+    const userNext = Math.ceil((user.inviteCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+    const userNeeded = Math.max(0, userNext - user.inviteCount);
     
     let referralStatus = '';
     if (user.referredBy && !user.referralCounted) {
@@ -776,10 +784,10 @@ bot.onText(/\/stats/, async (msg) => {
       `Next personal reward: ${userNeeded} more referrals\n` +
       `Total earned: ${user.totalEarned}\n\n` +
       `Community Progress:\n` +
-      `Total referrals: ${communityCount}\n` +
-      `Next unlock: ${needed} more referrals\n` +
+      `Total members: ${memberCount}\n` +
+      `Next unlock: ${needed} more members\n` +
       `Last content: ${stats.lastChannelPost ? stats.lastChannelPost.toDateString() : 'None yet'}\n\n` +
-      `Every ${INVITES_PER_REWARD} community referrals = new exclusive content!`;
+      `Every ${INVITES_PER_REWARD} community members = new exclusive content!`;
     
     const keyboard = {
       inline_keyboard: [
@@ -806,7 +814,7 @@ bot.onText(/\/help/, async (msg) => {
     `1. Get your invite link with /link\n` +
     `2. Share with friends\n` +
     `3. Friends must join @${CHANNEL_USERNAME}\n` +
-    `4. Every ${INVITES_PER_REWARD} community referrals unlock exclusive content!\n\n` +
+    `4. Every ${INVITES_PER_REWARD} community members unlock exclusive content!\n\n` +
     `Commands:\n` +
     `/start - Start the bot\n` +
     `/link - Get your invite link\n` +
@@ -859,7 +867,11 @@ bot.onText(/\/admin/, async (msg) => {
     `/block <id> - Block user\n` +
     `/unblock <id> - Unblock user\n` +
     `/reset_community - Reset counter\n` +
-    `/backup - Download backup`;
+    `/backup - Download backup\n\n` +
+    `Settings:\n` +
+    `Auto-post interval: ${AUTO_POST_HOURS} hours\n` +
+    `Members per reward: ${INVITES_PER_REWARD}\n` +
+    `Change via AUTO_POST_HOURS in .env`;
   
   await bot.sendMessage(chatId, adminHelp);
 });
@@ -886,7 +898,7 @@ bot.onText(/\/stats_admin/, async (msg) => {
       referralCounted: false 
     });
     const channelPosts = await ChannelPost.countDocuments();
-    const communityCount = stats.communityReferralCount || 0;
+    const memberCount = stats.communityMemberCount || 0;
     
     const message = 
       `StitchVault Admin Statistics:\n\n` +
@@ -896,13 +908,16 @@ bot.onText(/\/stats_admin/, async (msg) => {
       `Channel members: ${channelMembers}\n` +
       `Pending referrals: ${pendingReferrals}\n\n` +
       `Community Progress:\n` +
-      `Community referrals: ${communityCount}\n` +
+      `Community members: ${memberCount}\n` +
       `Individual referrals: ${totalInvites[0]?.total || 0}\n` +
-      `Next milestone: ${Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD}\n\n` +
+      `Next milestone: ${Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD}\n\n` +
       `Content:\n` +
       `Total rewards: ${totalRewards}\n` +
       `Channel posts: ${channelPosts}\n` +
       `Last post: ${stats.lastChannelPost ? stats.lastChannelPost.toLocaleString() : 'Never'}\n\n` +
+      `Settings:\n` +
+      `Auto-post interval: ${AUTO_POST_HOURS} hours\n` +
+      `Members per reward: ${INVITES_PER_REWARD}\n\n` +
       `Updated: ${new Date().toLocaleString()}`;
     
     await bot.sendMessage(chatId, message);
@@ -913,6 +928,28 @@ bot.onText(/\/stats_admin/, async (msg) => {
   }
 });
 
+bot.onText(/\/reset_community/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    await Stats.findOneAndUpdate(
+      {},
+      { communityMemberCount: 0 },
+      { upsert: true }
+    );
+    
+    bot.sendMessage(chatId, 'Community member counter has been reset to 0.');
+    
+  } catch (error) {
+    console.error('Reset community error:', error);
+    bot.sendMessage(chatId, 'Error resetting community counter.');
+  }
+});
+
+// Include other admin commands (bulk upload, rewards management, etc.)
 bot.onText(/\/bulk_upload/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -926,10 +963,10 @@ bot.onText(/\/bulk_upload/, async (msg) => {
     `3. Use /bulk_finish when done\n` +
     `4. Images become previews, ZIP/RAR become downloads\n\n` +
     `Naming Convention:\n` +
-    `"1.jpg" = Level 2 preview\n` +
-    `"1.zip" = Level 2 download\n` +
-    `"2.png" = Level 4 preview\n` +
-    `"2.rar" = Level 4 download\n\n` +
+    `"1.jpg" = Level ${INVITES_PER_REWARD} preview\n` +
+    `"1.zip" = Level ${INVITES_PER_REWARD} download\n` +
+    `"2.png" = Level ${INVITES_PER_REWARD * 2} preview\n` +
+    `"2.rar" = Level ${INVITES_PER_REWARD * 2} download\n\n` +
     `Commands:\n` +
     `/bulk_upload_files - Start session\n` +
     `/bulk_status - Check progress\n` +
@@ -1013,7 +1050,6 @@ bot.onText(/\/bulk_cancel/, async (msg) => {
   }
 });
 
-// Fixed send_channel command with proper image handling
 bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -1047,7 +1083,6 @@ bot.onText(/\/send_channel (\d+)/, async (msg, match) => {
   }
 });
 
-// Fixed test_channel command
 bot.onText(/\/test_channel (\d+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -1063,7 +1098,6 @@ bot.onText(/\/test_channel (\d+)/, async (msg, match) => {
       return bot.sendMessage(chatId, `No rewards found for level ${level}`);
     }
     
-    // Send test post
     const result = await sendToChannel(level, true);
     
     if (result && result.results) {
@@ -1080,38 +1114,6 @@ bot.onText(/\/test_channel (\d+)/, async (msg, match) => {
   } catch (error) {
     console.error('Test channel error:', error);
     bot.sendMessage(chatId, `Error: ${error.message}`);
-  }
-});
-
-bot.onText(/\/channel_history/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  
-  if (!isAdmin(userId)) return;
-  
-  try {
-    const posts = await ChannelPost.find().sort({ sentAt: -1 }).limit(10);
-    
-    if (posts.length === 0) {
-      return bot.sendMessage(chatId, 'No channel posts found.');
-    }
-    
-    let message = `Recent Channel Posts:\n\n`;
-    
-    posts.forEach((post, index) => {
-      const postType = post.communityReferrals === 0 ? 'Manual/Test' : `Community (${post.communityReferrals} refs)`;
-      message += 
-        `${index + 1}. Level ${post.rewardLevel} (${postType})\n` +
-        `${post.sentAt.toLocaleString()}\n` +
-        `Image: ${post.imageMessageId ? 'Yes' : 'No'}\n` +
-        `File: ${post.fileMessageId ? 'Yes' : 'No'}\n\n`;
-    });
-    
-    await bot.sendMessage(chatId, message);
-    
-  } catch (error) {
-    console.error('Channel history error:', error);
-    bot.sendMessage(chatId, 'Error fetching channel history.');
   }
 });
 
@@ -1175,28 +1177,39 @@ bot.onText(/\/delete_reward (\d+)/, async (msg, match) => {
   }
 });
 
-bot.onText(/\/reset_community/, async (msg) => {
+bot.onText(/\/channel_history/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   
   if (!isAdmin(userId)) return;
   
   try {
-    await Stats.findOneAndUpdate(
-      {},
-      { communityReferralCount: 0 },
-      { upsert: true }
-    );
+    const posts = await ChannelPost.find().sort({ sentAt: -1 }).limit(10);
     
-    bot.sendMessage(chatId, 'Community referral counter has been reset to 0.');
+    if (posts.length === 0) {
+      return bot.sendMessage(chatId, 'No channel posts found.');
+    }
+    
+    let message = `Recent Channel Posts:\n\n`;
+    
+    posts.forEach((post, index) => {
+      const postType = post.communityReferrals === 0 ? 'Manual/Test' : `Community (${post.communityReferrals} members)`;
+      message += 
+        `${index + 1}. Level ${post.rewardLevel} (${postType})\n` +
+        `${post.sentAt.toLocaleString()}\n` +
+        `Image: ${post.imageMessageId ? 'Yes' : 'No'}\n` +
+        `File: ${post.fileMessageId ? 'Yes' : 'No'}\n\n`;
+    });
+    
+    await bot.sendMessage(chatId, message);
     
   } catch (error) {
-    console.error('Reset community error:', error);
-    bot.sendMessage(chatId, 'Error resetting community counter.');
+    console.error('Channel history error:', error);
+    bot.sendMessage(chatId, 'Error fetching channel history.');
   }
 });
 
-// Include admin_features.js commands (they will be loaded when the file is required)
+// Include admin_features.js commands
 try {
   require('./admin_features.js');
   console.log('Admin features loaded successfully');
@@ -1250,7 +1263,7 @@ bot.on('photo', async (msg) => {
   );
 });
 
-// Fixed callback query handler
+// Fixed callback query handler with proper calculations
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const userId = callbackQuery.from.id;
@@ -1276,9 +1289,9 @@ bot.on('callback_query', async (callbackQuery) => {
       }
       
       const stats = await Stats.findOne() || {};
-      const communityCount = stats.communityReferralCount || 0;
-      const nextMilestone = Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-      const needed = nextMilestone - communityCount;
+      const memberCount = stats.communityMemberCount || 0;
+      const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+      const needed = Math.max(0, nextMilestone - memberCount);
       
       const inviteLink = `https://t.me/${BOT_USERNAME}?start=${user.referralCode}`;
       
@@ -1286,8 +1299,8 @@ bot.on('callback_query', async (callbackQuery) => {
         `Your StitchVault Link:\n` +
         `${inviteLink}\n\n` +
         `Your referrals: ${user.inviteCount}\n` +
-        `Community: ${communityCount} referrals\n` +
-        `Next unlock: ${needed} more referrals\n\n` +
+        `Community: ${memberCount} members\n` +
+        `Next unlock: ${needed} more members\n\n` +
         `Share to unlock exclusive designs!\n` +
         `Friends must join @${CHANNEL_USERNAME}`;
       
@@ -1302,7 +1315,6 @@ bot.on('callback_query', async (callbackQuery) => {
       await bot.answerCallbackQuery(callbackQuery.id, { text: 'Here is your invite link!' });
       
     } else if (data === 'my_stats') {
-      // Simulate /stats command
       const user = await User.findOne({ userId });
       if (!user) {
         await bot.answerCallbackQuery(callbackQuery.id, { 
@@ -1313,12 +1325,12 @@ bot.on('callback_query', async (callbackQuery) => {
       }
       
       const stats = await Stats.findOne() || {};
-      const communityCount = stats.communityReferralCount || 0;
-      const nextMilestone = Math.ceil(communityCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-      const needed = nextMilestone - communityCount;
+      const memberCount = stats.communityMemberCount || 0;
+      const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+      const needed = Math.max(0, nextMilestone - memberCount);
       
-      const userNext = Math.ceil(user.inviteCount / INVITES_PER_REWARD) * INVITES_PER_REWARD;
-      const userNeeded = userNext - user.inviteCount;
+      const userNext = Math.ceil((user.inviteCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
+      const userNeeded = Math.max(0, userNext - user.inviteCount);
       
       let referralStatus = '';
       if (user.referredBy && !user.referralCounted) {
@@ -1338,10 +1350,10 @@ bot.on('callback_query', async (callbackQuery) => {
         `Next personal reward: ${userNeeded} more referrals\n` +
         `Total earned: ${user.totalEarned}\n\n` +
         `Community Progress:\n` +
-        `Total referrals: ${communityCount}\n` +
-        `Next unlock: ${needed} more referrals\n` +
+        `Total members: ${memberCount}\n` +
+        `Next unlock: ${needed} more members\n` +
         `Last content: ${stats.lastChannelPost ? stats.lastChannelPost.toDateString() : 'None yet'}\n\n` +
-        `Every ${INVITES_PER_REWARD} community referrals = new exclusive content!`;
+        `Every ${INVITES_PER_REWARD} community members = new exclusive content!`;
       
       const keyboard = {
         inline_keyboard: [
@@ -1354,14 +1366,13 @@ bot.on('callback_query', async (callbackQuery) => {
       await bot.answerCallbackQuery(callbackQuery.id, { text: 'Here are your stats!' });
       
     } else if (data === 'help') {
-      // Simulate /help command
       const helpMessage = 
         `StitchVault Community Help\n\n` +
         `How it works:\n` +
         `1. Get your invite link with /link\n` +
         `2. Share with friends\n` +
         `3. Friends must join @${CHANNEL_USERNAME}\n` +
-        `4. Every ${INVITES_PER_REWARD} community referrals unlock exclusive content!\n\n` +
+        `4. Every ${INVITES_PER_REWARD} community members unlock exclusive content!\n\n` +
         `Commands:\n` +
         `/start - Start the bot\n` +
         `/link - Get your invite link\n` +
@@ -1384,7 +1395,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await bot.answerCallbackQuery(callbackQuery.id, { text: 'Help information sent!' });
       
     } else if (isAdmin(userId)) {
-      // Handle admin callback queries from admin_features.js
+      // Handle admin callback queries
       if (data.startsWith('users_page_')) {
         await bot.answerCallbackQuery(callbackQuery.id);
       } else if (data.startsWith('admin_block_')) {
@@ -1473,22 +1484,22 @@ async function periodicMembershipCheck() {
           detectedJoins++;
           user.joinedChannel = true;
           
-          // Only send welcome if not in cooldown
           const welcomeKey = `welcome_${user.userId}`;
           if (!welcomeCooldown.has(welcomeKey)) {
             welcomeCooldown.add(welcomeKey);
             
-            // Remove from cooldown after 5 minutes
             setTimeout(() => {
               welcomeCooldown.delete(welcomeKey);
             }, 5 * 60 * 1000);
             
-            if (user.referredBy && !user.referralCounted) {
-              await countReferral(user);
-              
+            // Count this member toward community progress
+            const memberCount = await countMember(user);
+            
+            if (user.referredBy && user.referralCounted) {
               bot.sendMessage(user.userId, 
                 `Welcome to StitchVault community!\n\n` +
                 `Your referral has been counted toward our community goal!\n` +
+                `Community members: ${memberCount}\n` +
                 `Help us unlock more exclusive design collections!\n\n` +
                 `Get your invite link: /link\n` +
                 `Check community progress: /stats`
@@ -1496,7 +1507,9 @@ async function periodicMembershipCheck() {
             } else {
               bot.sendMessage(user.userId, 
                 `Welcome to StitchVault!\n\n` +
-                `Start helping our community unlock exclusive designs!\n\n` +
+                `You're now part of our growing community!\n` +
+                `Community members: ${memberCount}\n` +
+                `Start helping us unlock exclusive designs!\n\n` +
                 `Get your invite link: /link\n` +
                 `Check community progress: /stats`
               ).catch(() => {});
@@ -1547,19 +1560,23 @@ bot.on('chat_member', async (chatMember) => {
               welcomeCooldown.delete(welcomeKey);
             }, 5 * 60 * 1000);
             
-            if (user.referredBy && !user.referralCounted) {
-              await countReferral(user);
-              
+            // Count this member toward community progress
+            const memberCount = await countMember(user);
+            
+            if (user.referredBy && user.referralCounted) {
               bot.sendMessage(userId, 
                 `Welcome to StitchVault community!\n\n` +
                 `Your referral counted toward our community goal!\n` +
+                `Community members: ${memberCount}\n` +
                 `Help us unlock more exclusive designs!\n\n` +
                 `Get your invite link: /link`
               ).catch(() => {});
             } else {
               bot.sendMessage(userId, 
                 `Welcome to StitchVault!\n\n` +
-                `Help our community unlock exclusive designs!\n\n` +
+                `You're now part of our growing community!\n` +
+                `Community members: ${memberCount}\n` +
+                `Help us unlock exclusive designs!\n\n` +
                 `Get your invite link: /link`
               ).catch(() => {});
             }
@@ -1567,6 +1584,12 @@ bot.on('chat_member', async (chatMember) => {
         }
       } else if (['left', 'kicked'].includes(status)) {
         user.joinedChannel = false;
+        // Decrease community count when someone leaves
+        await Stats.findOneAndUpdate(
+          {},
+          { $inc: { communityMemberCount: -1 } },
+          { upsert: true }
+        );
       }
       
       await user.save();
@@ -1601,4 +1624,7 @@ cron.schedule('*/5 * * * *', async () => {
   await periodicMembershipCheck();
 });
 
-console.log('StitchVault Community Bot started successfully!');
+console.log(`StitchVault Community Bot started successfully!`);
+console.log(`Auto-post interval: ${AUTO_POST_HOURS} hours`);
+console.log(`Members per reward: ${INVITES_PER_REWARD}`);
+console.log(`Channel: @${CHANNEL_USERNAME}`);
