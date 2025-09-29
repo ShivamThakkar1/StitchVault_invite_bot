@@ -413,7 +413,18 @@ async function checkMilestoneReached(memberCount) {
   return false;
 }
 
-// Enhanced community counting
+// Get actual channel member count from Telegram
+async function getChannelMemberCount() {
+  try {
+    const chatInfo = await bot.getChat(CHANNEL_ID);
+    return chatInfo.members_count || 0;
+  } catch (error) {
+    console.error('Error getting channel member count:', error);
+    return 0;
+  }
+}
+
+// Enhanced community counting - uses REAL channel subscriber count
 async function countMember(user) {
   // Count individual referral
   if (user.referredBy && !user.referralCounted) {
@@ -434,18 +445,19 @@ async function countMember(user) {
     }
   }
   
-  // Update community member count
-  const stats = await Stats.findOneAndUpdate(
+  // Get REAL channel subscriber count from Telegram
+  const actualMemberCount = await getChannelMemberCount();
+  
+  // Update stats with real count
+  await Stats.findOneAndUpdate(
     {},
-    { $inc: { communityMemberCount: 1 } },
-    { upsert: true, new: true }
+    { communityMemberCount: actualMemberCount },
+    { upsert: true }
   );
   
-  const memberCount = stats.communityMemberCount;
-  
   // Check if milestone reached
-  if (await checkMilestoneReached(memberCount)) {
-    const result = await sendNextToChannel(memberCount);
+  if (await checkMilestoneReached(actualMemberCount)) {
+    const result = await sendNextToChannel(actualMemberCount);
     
     // Notify admins
     if (result && result.nextSequence) {
@@ -453,7 +465,7 @@ async function countMember(user) {
         try {
           await bot.sendMessage(adminId, 
             `🎉 Community Milestone Reached!\n\n` +
-            `Total members: ${memberCount}\n` +
+            `Total channel subscribers: ${actualMemberCount}\n` +
             `Posted sequence: ${result.nextSequence}\n` +
             `Latest join: ${user.firstName}${user.referredBy ? ' (referred)' : ' (direct)'}\n\n` +
             result.results.join('\n')
@@ -465,7 +477,7 @@ async function countMember(user) {
     }
   }
   
-  return memberCount;
+  return actualMemberCount;
 }
 
 // Fallback content posting
@@ -871,6 +883,7 @@ bot.onText(/\/admin/, async (msg) => {
     `🛠 StitchVault Admin Commands:\n\n` +
     `📊 Analytics:\n` +
     `/stats_admin - Bot statistics\n` +
+    `/sync_count - Sync real channel count\n` +
     `/users - List users\n` +
     `/user <id> - User details\n\n` +
     `📁 Content:\n` +
@@ -890,7 +903,8 @@ bot.onText(/\/admin/, async (msg) => {
     `/reset_sequence - Reset posting sequence\n\n` +
     `Settings:\n` +
     `Auto-post: ${AUTO_POST_HOURS} hours\n` +
-    `Members per reward: ${INVITES_PER_REWARD}`;
+    `Members per reward: ${INVITES_PER_REWARD}\n\n` +
+    `Note: Bot now counts REAL channel subscribers (including bots)`;
   
   await bot.sendMessage(chatId, adminHelp);
 });
@@ -1051,6 +1065,41 @@ bot.onText(/\/reset_sequence/, async (msg) => {
   } catch (error) {
     console.error('Reset sequence error:', error);
     bot.sendMessage(chatId, 'Error resetting sequence.');
+  }
+});
+
+bot.onText(/\/sync_count/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    const actualCount = await getChannelMemberCount();
+    
+    await Stats.findOneAndUpdate(
+      {},
+      { communityMemberCount: actualCount },
+      { upsert: true }
+    );
+    
+    const stats = await Stats.findOne() || {};
+    const lastPosted = stats.lastPostedSequence || 0;
+    const milestonesReached = Math.floor(actualCount / INVITES_PER_REWARD);
+    const shouldHavePosted = milestonesReached;
+    
+    bot.sendMessage(chatId, 
+      `✅ Channel count synced!\n\n` +
+      `Real channel subscribers: ${actualCount}\n` +
+      `Last posted sequence: ${lastPosted}\n` +
+      `Milestones reached: ${milestonesReached}\n` +
+      `Should have posted: ${shouldHavePosted} sequences\n\n` +
+      `${shouldHavePosted > lastPosted ? `⚠️ ${shouldHavePosted - lastPosted} sequences behind!` : '✅ Up to date!'}`
+    );
+    
+  } catch (error) {
+    console.error('Sync count error:', error);
+    bot.sendMessage(chatId, 'Error syncing channel count.');
   }
 });
 
@@ -1500,9 +1549,11 @@ bot.on('chat_member', async (chatMember) => {
         }
       } else if (['left', 'kicked'].includes(status)) {
         user.joinedChannel = false;
+        // Update with real channel count when someone leaves
+        const actualMemberCount = await getChannelMemberCount();
         await Stats.findOneAndUpdate(
           {},
-          { $inc: { communityMemberCount: -1 } },
+          { communityMemberCount: actualMemberCount },
           { upsert: true }
         );
       }
