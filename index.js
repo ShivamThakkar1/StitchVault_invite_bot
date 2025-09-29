@@ -413,14 +413,19 @@ async function checkMilestoneReached(memberCount) {
   return false;
 }
 
-// Get actual channel member count from Telegram
+// Get actual channel member count from Telegram (includes bot)
 async function getChannelMemberCount() {
   try {
-    const chatInfo = await bot.getChat(CHANNEL_ID);
-    return chatInfo.members_count || 0;
+    // Use getChatMemberCount - this already includes the bot and all members
+    const memberCount = await bot.getChatMemberCount(CHANNEL_ID);
+    // Telegram's count already includes bots, so just return it
+    return memberCount || 0;
   } catch (error) {
     console.error('Error getting channel member count:', error);
-    return 0;
+    // Fallback: count users in our database who joined the channel + 1 for bot
+    const dbCount = await User.countDocuments({ joinedChannel: true });
+    console.log(`Using database count as fallback: ${dbCount} + 1 (bot) = ${dbCount + 1}`);
+    return dbCount + 1; // Add 1 to include the bot
   }
 }
 
@@ -883,7 +888,8 @@ bot.onText(/\/admin/, async (msg) => {
     `🛠 StitchVault Admin Commands:\n\n` +
     `📊 Analytics:\n` +
     `/stats_admin - Bot statistics\n` +
-    `/sync_count - Sync real channel count\n` +
+    `/sync_count - Auto-sync channel count\n` +
+    `/set_count <number> - Manually set count\n` +
     `/users - List users\n` +
     `/user <id> - User details\n\n` +
     `📁 Content:\n` +
@@ -904,7 +910,7 @@ bot.onText(/\/admin/, async (msg) => {
     `Settings:\n` +
     `Auto-post: ${AUTO_POST_HOURS} hours\n` +
     `Members per reward: ${INVITES_PER_REWARD}\n\n` +
-    `Note: Bot now counts REAL channel subscribers (including bots)`;
+    `Note: Use /set_count if auto-sync fails`;
   
   await bot.sendMessage(chatId, adminHelp);
 });
@@ -1075,7 +1081,35 @@ bot.onText(/\/sync_count/, async (msg) => {
   if (!isAdmin(userId)) return;
   
   try {
-    const actualCount = await getChannelMemberCount();
+    let actualCount = 0;
+    let method = '';
+    
+    // Try to get real count from Telegram
+    try {
+      actualCount = await bot.getChatMemberCount(CHANNEL_ID);
+      method = 'Telegram API';
+      
+      if (actualCount === 0) {
+        throw new Error('API returned 0');
+      }
+    } catch (apiError) {
+      // Fallback to database count + 1 for bot
+      const dbCount = await User.countDocuments({ joinedChannel: true });
+      actualCount = dbCount + 1;
+      method = 'Database + Bot';
+      
+      await bot.sendMessage(chatId, 
+        `⚠️ Cannot get real channel count from Telegram API!\n\n` +
+        `Error: ${apiError.message}\n\n` +
+        `Possible reasons:\n` +
+        `1. Bot is not admin in channel\n` +
+        `2. CHANNEL_ID format incorrect\n` +
+        `3. Bot lacks permissions\n\n` +
+        `Using fallback: Database count (${dbCount}) + Bot (1) = ${actualCount}\n\n` +
+        `To manually set count, use:\n` +
+        `/set_count <number>`
+      );
+    }
     
     await Stats.findOneAndUpdate(
       {},
@@ -1090,7 +1124,8 @@ bot.onText(/\/sync_count/, async (msg) => {
     
     bot.sendMessage(chatId, 
       `✅ Channel count synced!\n\n` +
-      `Real channel subscribers: ${actualCount}\n` +
+      `Method: ${method}\n` +
+      `Channel subscribers: ${actualCount}\n` +
       `Last posted sequence: ${lastPosted}\n` +
       `Milestones reached: ${milestonesReached}\n` +
       `Should have posted: ${shouldHavePosted} sequences\n\n` +
@@ -1099,7 +1134,38 @@ bot.onText(/\/sync_count/, async (msg) => {
     
   } catch (error) {
     console.error('Sync count error:', error);
-    bot.sendMessage(chatId, 'Error syncing channel count.');
+    bot.sendMessage(chatId, `Error syncing channel count: ${error.message}`);
+  }
+});
+
+bot.onText(/\/set_count (\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const count = parseInt(match[1]);
+  
+  if (!isAdmin(userId)) return;
+  
+  try {
+    await Stats.findOneAndUpdate(
+      {},
+      { communityMemberCount: count },
+      { upsert: true }
+    );
+    
+    const stats = await Stats.findOne() || {};
+    const lastPosted = stats.lastPostedSequence || 0;
+    const milestonesReached = Math.floor(count / INVITES_PER_REWARD);
+    
+    bot.sendMessage(chatId, 
+      `✅ Channel count manually set!\n\n` +
+      `Subscribers: ${count}\n` +
+      `Last posted: ${lastPosted}\n` +
+      `Milestones reached: ${milestonesReached}\n\n` +
+      `${milestonesReached > lastPosted ? `Ready to post ${milestonesReached - lastPosted} more sequences!` : 'Up to date!'}`
+    );
+  } catch (error) {
+    console.error('Set count error:', error);
+    bot.sendMessage(chatId, `Error setting count: ${error.message}`);
   }
 });
 
