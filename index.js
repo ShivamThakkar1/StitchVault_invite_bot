@@ -24,7 +24,7 @@ const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || 'stitchvault';
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id)) : [];
 const INVITES_PER_REWARD = parseInt(process.env.INVITES_PER_REWARD) || 2;
 const BOT_USERNAME = process.env.BOT_USERNAME || 'StitchVaultBot';
-const AUTO_POST_HOURS = parseInt(process.env.AUTO_POST_HOURS) || 48;
+const AUTO_POST_HOURS = parseInt(process.env.AUTO_POST_HOURS) || 24;
 
 // Initialize bot
 const bot = new TelegramBot(BOT_TOKEN, { 
@@ -61,7 +61,7 @@ async function setupChatMemberUpdates() {
   }
 }
 
-// User Schema - SIMPLIFIED (no more lastRewardLevel)
+// User Schema
 const userSchema = new mongoose.Schema({
   userId: { type: Number, required: true, unique: true },
   username: String,
@@ -72,6 +72,7 @@ const userSchema = new mongoose.Schema({
   inviteCount: { type: Number, default: 0 },
   joinedChannel: { type: Boolean, default: false },
   referralCounted: { type: Boolean, default: false },
+  communityCountCounted: { type: Boolean, default: false }, // NEW: Track if counted toward community goal
   joinedAt: { type: Date, default: Date.now },
   lastActivity: { type: Date, default: Date.now },
   isBlocked: { type: Boolean, default: false },
@@ -80,7 +81,7 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', userSchema);
 
-// Reward Schema - CHANGED: No levels, just sequential order
+// Reward Schema
 const rewardSchema = new mongoose.Schema({
   rewardId: { type: Number, required: true, unique: true },
   sequenceNumber: { type: Number, required: true },
@@ -110,13 +111,14 @@ const channelPostSchema = new mongoose.Schema({
 
 const ChannelPost = mongoose.model('ChannelPost', channelPostSchema);
 
-// Stats Schema
+// Stats Schema - UPDATED with lastAutoPostCheck
 const statsSchema = new mongoose.Schema({
   totalUsers: { type: Number, default: 0 },
   totalInvites: { type: Number, default: 0 },
   totalRewards: { type: Number, default: 0 },
   channelMembers: { type: Number, default: 0 },
   lastChannelPost: { type: Date, default: null },
+  lastAutoPostCheck: { type: Date, default: null }, // NEW: Track last auto-post check
   lastPostedSequence: { type: Number, default: 0 },
   communityMemberCount: { type: Number, default: 0 },
   lastUpdated: { type: Date, default: Date.now }
@@ -164,7 +166,6 @@ async function updateStats() {
       totalInvites: totalInvites[0]?.total || 0,
       totalRewards,
       channelMembers,
-      communityMemberCount: channelMembers,
       lastUpdated: new Date()
     },
     { upsert: true }
@@ -236,7 +237,7 @@ async function downloadAndSendAsPhoto(channelId, fileId, fileName, caption = nul
 }
 
 // CORE FUNCTION: Post next file in sequence to channel
-async function sendNextToChannel(memberCount, isTest = false) {
+async function sendNextToChannel(memberCount, isTest = false, isManual = false) {
   try {
     const stats = await Stats.findOne() || {};
     const lastPosted = stats.lastPostedSequence || 0;
@@ -373,16 +374,19 @@ async function sendNextToChannel(memberCount, isTest = false) {
       });
       await channelPost.save();
       
-      // Update stats
+      // Update stats - FIXED: Update both lastChannelPost AND lastAutoPostCheck
       if (!isTest) {
-        await Stats.findOneAndUpdate(
-          {},
-          { 
-            lastChannelPost: new Date(),
-            lastPostedSequence: nextSequence
-          },
-          { upsert: true }
-        );
+        const updateData = { 
+          lastChannelPost: new Date(),
+          lastPostedSequence: nextSequence
+        };
+        
+        // Only update lastAutoPostCheck if this is NOT a manual post
+        if (!isManual) {
+          updateData.lastAutoPostCheck = new Date();
+        }
+        
+        await Stats.findOneAndUpdate({}, updateData, { upsert: true });
       }
     }
     
@@ -396,17 +400,17 @@ async function sendNextToChannel(memberCount, isTest = false) {
 
 global.sendToChannel = sendNextToChannel;
 
-// Check if milestone reached
+// FIXED: Check if we should post based on ACTUAL community member count
 async function checkMilestoneReached(memberCount) {
   const stats = await Stats.findOne() || {};
   const lastPosted = stats.lastPostedSequence || 0;
   
-  // Calculate how many milestones should have been reached
-  const milestonesReached = Math.floor(memberCount / INVITES_PER_REWARD);
+  // Calculate how many posts should have been made based on member count
+  const postsNeeded = Math.floor(memberCount / INVITES_PER_REWARD);
   
-  // If we have more milestones reached than files posted, post next file
-  if (milestonesReached > lastPosted) {
-    console.log(`Milestone reached! Members: ${memberCount}, Last posted: ${lastPosted}`);
+  // If we need more posts than we've made, return true
+  if (postsNeeded > lastPosted) {
+    console.log(`Milestone reached! Members: ${memberCount}, Posts needed: ${postsNeeded}, Last posted: ${lastPosted}`);
     return true;
   }
   
@@ -416,22 +420,19 @@ async function checkMilestoneReached(memberCount) {
 // Get actual channel member count from Telegram (includes bot)
 async function getChannelMemberCount() {
   try {
-    // Use getChatMemberCount - this already includes the bot and all members
     const memberCount = await bot.getChatMemberCount(CHANNEL_ID);
-    // Telegram's count already includes bots, so just return it
     return memberCount || 0;
   } catch (error) {
     console.error('Error getting channel member count:', error);
-    // Fallback: count users in our database who joined the channel + 1 for bot
     const dbCount = await User.countDocuments({ joinedChannel: true });
     console.log(`Using database count as fallback: ${dbCount} + 1 (bot) = ${dbCount + 1}`);
-    return dbCount + 1; // Add 1 to include the bot
+    return dbCount + 1;
   }
 }
 
-// Enhanced community counting - uses REAL channel subscriber count
+// FIXED: Count ALL members - both direct joins and referrals
 async function countMember(user) {
-  // Count individual referral
+  // Count individual referral (for user's personal stats)
   if (user.referredBy && !user.referralCounted) {
     const referrer = await User.findOne({ userId: user.referredBy });
     if (referrer) {
@@ -441,7 +442,7 @@ async function countMember(user) {
       user.referralCounted = true;
       await user.save();
       
-      // Notify referrer (NO REWARDS IN DM)
+      // Notify referrer
       bot.sendMessage(referrer.userId, 
         `✅ Referral confirmed! ${user.firstName} joined StitchVault!\n\n` +
         `Your referrals: ${referrer.inviteCount}\n` +
@@ -460,9 +461,9 @@ async function countMember(user) {
     { upsert: true }
   );
   
-  // Check if milestone reached
+  // Check if milestone reached and post if needed
   if (await checkMilestoneReached(actualMemberCount)) {
-    const result = await sendNextToChannel(actualMemberCount);
+    const result = await sendNextToChannel(actualMemberCount, false, false);
     
     // Notify admins
     if (result && result.nextSequence) {
@@ -472,7 +473,7 @@ async function countMember(user) {
             `🎉 Community Milestone Reached!\n\n` +
             `Total channel subscribers: ${actualMemberCount}\n` +
             `Posted sequence: ${result.nextSequence}\n` +
-            `Latest join: ${user.firstName}${user.referredBy ? ' (referred)' : ' (direct)'}\n\n` +
+            `Latest join: ${user.firstName}${user.referredBy ? ' (referred)' : ' (direct join)'}\n\n` +
             result.results.join('\n')
           );
         } catch (error) {
@@ -485,28 +486,32 @@ async function countMember(user) {
   return actualMemberCount;
 }
 
-// Fallback content posting
+// FIXED: Auto-post every 24 hours from LAST post (not midnight)
 async function checkAndSendFallback() {
   try {
     const stats = await Stats.findOne();
     const now = new Date();
-    const lastPost = stats?.lastChannelPost;
+    
+    // Use lastAutoPostCheck instead of lastChannelPost
+    // This way manual posts don't reset the timer
+    const lastCheck = stats?.lastAutoPostCheck || stats?.lastChannelPost;
     
     const fallbackIntervalMs = AUTO_POST_HOURS * 60 * 60 * 1000;
     
-    if (!lastPost || (now - lastPost) >= fallbackIntervalMs) {
-      console.log(`${AUTO_POST_HOURS} hours passed, sending fallback content...`);
+    if (!lastCheck || (now - lastCheck) >= fallbackIntervalMs) {
+      console.log(`${AUTO_POST_HOURS} hours passed since last auto-post check, sending content...`);
       
       const currentCount = stats?.communityMemberCount || 0;
-      const result = await sendNextToChannel(currentCount);
+      const result = await sendNextToChannel(currentCount, false, false);
       
       if (result && result.nextSequence) {
         // Notify admins
         for (const adminId of ADMIN_IDS) {
           try {
+            const hoursSincePost = lastCheck ? Math.floor((now - lastCheck) / (1000 * 60 * 60)) : AUTO_POST_HOURS;
             await bot.sendMessage(adminId, 
               `⏰ Auto-post triggered!\n\n` +
-              `Last post: ${lastPost ? Math.floor((now - lastPost) / (1000 * 60 * 60)) : `${AUTO_POST_HOURS}+`} hours ago\n` +
+              `Last auto-post: ${hoursSincePost} hours ago\n` +
               `Posted sequence: ${result.nextSequence}\n` +
               `Community members: ${currentCount}\n\n` +
               result.results.join('\n')
@@ -516,6 +521,10 @@ async function checkAndSendFallback() {
           }
         }
       }
+    } else {
+      const hoursSince = Math.floor((now - lastCheck) / (1000 * 60 * 60));
+      const hoursRemaining = AUTO_POST_HOURS - hoursSince;
+      console.log(`Auto-post check: ${hoursSince}/${AUTO_POST_HOURS} hours passed. Next post in ~${hoursRemaining} hours.`);
     }
   } catch (error) {
     console.error('Error in fallback check:', error);
@@ -910,7 +919,7 @@ bot.onText(/\/admin/, async (msg) => {
     `Settings:\n` +
     `Auto-post: ${AUTO_POST_HOURS} hours\n` +
     `Members per reward: ${INVITES_PER_REWARD}\n\n` +
-    `Note: Use /set_count if auto-sync fails`;
+    `Note: Manual posts don't reset auto-post timer`;
   
   await bot.sendMessage(chatId, adminHelp);
 });
@@ -939,6 +948,16 @@ bot.onText(/\/stats_admin/, async (msg) => {
     const nextMilestone = Math.ceil((memberCount + 1) / INVITES_PER_REWARD) * INVITES_PER_REWARD;
     const needed = Math.max(0, nextMilestone - memberCount);
     
+    // Calculate time until next auto-post
+    const now = new Date();
+    const lastCheck = stats?.lastAutoPostCheck || stats?.lastChannelPost;
+    let autoPostStatus = 'Never posted';
+    if (lastCheck) {
+      const hoursSince = Math.floor((now - lastCheck) / (1000 * 60 * 60));
+      const hoursRemaining = Math.max(0, AUTO_POST_HOURS - hoursSince);
+      autoPostStatus = `Next in ~${hoursRemaining} hours (${hoursSince}/${AUTO_POST_HOURS}h passed)`;
+    }
+    
     const message = 
       `📊 StitchVault Admin Statistics:\n\n` +
       `👥 Users:\n` +
@@ -956,8 +975,11 @@ bot.onText(/\/stats_admin/, async (msg) => {
       `Remaining: ${totalRewards - postedRewards}\n` +
       `Channel posts made: ${channelPosts}\n` +
       `Last post: ${stats.lastChannelPost ? stats.lastChannelPost.toLocaleString() : 'Never'}\n\n` +
+      `⏰ Auto-Post:\n` +
+      `Interval: ${AUTO_POST_HOURS} hours\n` +
+      `Status: ${autoPostStatus}\n` +
+      `Last auto-check: ${lastCheck ? lastCheck.toLocaleString() : 'Never'}\n\n` +
       `⚙️ Settings:\n` +
-      `Auto-post interval: ${AUTO_POST_HOURS} hours\n` +
       `Members per reward: ${INVITES_PER_REWARD}\n\n` +
       `Updated: ${new Date().toLocaleString()}`;
     
@@ -979,14 +1001,16 @@ bot.onText(/\/post_next/, async (msg) => {
     const stats = await Stats.findOne() || {};
     const currentCount = stats.communityMemberCount || 0;
     
-    const result = await sendNextToChannel(currentCount);
+    // Pass isManual=true to prevent resetting auto-post timer
+    const result = await sendNextToChannel(currentCount, false, true);
     
     if (result && result.results) {
       bot.sendMessage(chatId, 
         `✅ Manual Post Complete!\n\n` +
         `Sequence posted: ${result.nextSequence}\n` +
         `Community members: ${currentCount}\n\n` +
-        result.results.join('\n')
+        result.results.join('\n') +
+        `\n\n⏰ Note: Manual posts don't reset the auto-post timer`
       );
     } else {
       bot.sendMessage(chatId, `No more content to post!`);
@@ -1008,7 +1032,7 @@ bot.onText(/\/test_next/, async (msg) => {
     const stats = await Stats.findOne() || {};
     const currentCount = stats.communityMemberCount || 0;
     
-    const result = await sendNextToChannel(currentCount, true);
+    const result = await sendNextToChannel(currentCount, true, false);
     
     if (result && result.results) {
       bot.sendMessage(chatId, 
@@ -1180,7 +1204,7 @@ bot.onText(/\/bulk_upload/, async (msg) => {
     `1. Use /bulk_upload_files to start session\n` +
     `2. Send multiple files/images\n` +
     `3. Use /bulk_finish when done\n\n` +
-    `📝 Naming Convention:\n` +
+    `📁 Naming Convention:\n` +
     `"0.jpg" = Welcome bonus (sequence 0)\n` +
     `"1.jpg" = First unlock preview (sequence 1)\n` +
     `"1.zip" = First unlock download (sequence 1)\n` +
@@ -1516,7 +1540,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// Periodic membership check
+// Periodic membership check - CHECKS BOTH REFERRAL AND DIRECT JOINS
 async function periodicMembershipCheck() {
   try {
     const newUsers = await User.find({
@@ -1549,6 +1573,7 @@ async function periodicMembershipCheck() {
               welcomeCooldown.delete(welcomeKey);
             }, 5 * 60 * 1000);
             
+            // Count this member (works for both referral and direct joins)
             const memberCount = await countMember(user);
             
             bot.sendMessage(user.userId, 
@@ -1573,13 +1598,14 @@ async function periodicMembershipCheck() {
     
     if (detectedJoins > 0) {
       await updateStats();
+      console.log(`Detected ${detectedJoins} new channel joins`);
     }
   } catch (error) {
     console.error('Periodic membership check error:', error);
   }
 }
 
-// Channel member tracking
+// Channel member tracking - COUNTS BOTH REFERRAL AND DIRECT JOINS
 bot.on('chat_member', async (chatMember) => {
   if (chatMember.chat.id.toString() !== CHANNEL_ID) return;
   
@@ -1587,13 +1613,33 @@ bot.on('chat_member', async (chatMember) => {
   const status = chatMember.new_chat_member.status;
   
   try {
-    const user = await User.findOne({ userId });
+    let user = await User.findOne({ userId });
+    
+    // If user doesn't exist in database, create them (direct join)
+    if (!user && ['member', 'administrator', 'creator'].includes(status)) {
+      const userInfo = chatMember.new_chat_member.user;
+      const referralCode = generateReferralCode(userId);
+      
+      user = new User({
+        userId,
+        username: userInfo.username,
+        firstName: userInfo.first_name,
+        lastName: userInfo.last_name,
+        referralCode,
+        joinedChannel: true
+      });
+      
+      await user.save();
+      console.log(`New direct join created: ${userInfo.first_name} (${userId})`);
+    }
+    
     if (user) {
       const wasChannelMember = user.joinedChannel;
       
       if (['member', 'administrator', 'creator'].includes(status)) {
         user.joinedChannel = true;
         
+        // Only count and welcome if this is a NEW join
         if (!wasChannelMember) {
           const welcomeKey = `welcome_${userId}`;
           if (!welcomeCooldown.has(welcomeKey)) {
@@ -1603,6 +1649,7 @@ bot.on('chat_member', async (chatMember) => {
               welcomeCooldown.delete(welcomeKey);
             }, 5 * 60 * 1000);
             
+            // Count member - works for both referral and direct joins
             const memberCount = await countMember(user);
             
             bot.sendMessage(userId, 
@@ -1644,18 +1691,25 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection:', reason);
 });
 
-// Cron jobs
-cron.schedule('0 0 * * *', async () => {
-  console.log('Running daily tasks...');
+// FIXED: Cron jobs - Check auto-post every hour instead of once at midnight
+cron.schedule('0 * * * *', async () => {
+  console.log('Running hourly auto-post check...');
   await checkAndSendFallback();
+});
+
+// Daily stats update
+cron.schedule('0 0 * * *', async () => {
+  console.log('Running daily stats update...');
   await updateStats();
 });
 
+// Periodic membership check every 5 minutes
 cron.schedule('*/5 * * * *', async () => {
   await periodicMembershipCheck();
 });
 
 console.log(`StitchVault Community Bot started successfully!`);
-console.log(`Auto-post interval: ${AUTO_POST_HOURS} hours`);
+console.log(`Auto-post interval: ${AUTO_POST_HOURS} hours (checked every hour)`);
 console.log(`Members per reward: ${INVITES_PER_REWARD}`);
 console.log(`Channel: @${CHANNEL_USERNAME}`);
+      
